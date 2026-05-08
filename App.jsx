@@ -1,0 +1,3330 @@
+import { useState, useEffect, useCallback, useRef } from "react";
+
+// ============================================================================
+// Digital Health Navigator Training — Standalone training app
+// All four modules with full content, fillable forms, LLM practice launchers
+// Mirrors DOORS AI architecture (single-file, inline styles)
+// ============================================================================
+
+const NAVY = "#1a2744";
+const TEAL = "#2a9d8f";
+const TEAL_DARK = "#228176";
+const TEAL_LIGHT = "#e6f5f3";
+const WARM = "#f8f6f1";
+const WARM_DIM = "#edeae3";
+const CAUTION = "#e76f51";
+const CAUTION_LIGHT = "#fdeee9";
+const GOLD = "#d4a843";
+const GOLD_LIGHT = "#fdf6e3";
+const GOLD_DARK = "#9a7a2e";
+const WHITE = "#ffffff";
+const TEXT = "#1e1e1e";
+const TEXT_MID = "#4a4a4a";
+const TEXT_LIGHT = "#717171";
+
+const modules = [
+  {
+    id: "troubleshooting",
+    label: "1. Troubleshooting & Digital Autonomy",
+    short: "Troubleshooting",
+    sdt: "Autonomy",
+    sdtBlurb: "The client's capacity to use technology without external support for self-defined purposes. The navigator's job is not to fix the device but to leave the client with a method they could use again, without you.",
+    activities: ["resource-guide", "scenarios", "llm"],
+  },
+  {
+    id: "competence",
+    label: "2. DOORS & Digital Competence",
+    short: "Competence",
+    sdt: "Competence",
+    sdtBlurb: "The client's growing sense that they can do this, that the device is something they operate rather than something that happens to them. The navigator's job is to teach in a way that builds that sense, not to deposit information into them.",
+    activities: ["explain", "match", "chunk", "llm"],
+  },
+  {
+    id: "relatedness",
+    label: "3. Healthcare & Digital Relatedness",
+    short: "Relatedness",
+    sdtBlurb: "The client's sense that they are not alone with their device or their health goal. The navigator's job is to be a person on the other side of the technology: someone they can come back to, who structured the plan with them, who will check in.",
+    sdt: "Relatedness",
+    activities: ["keyphrase", "health-goals", "use-plan", "llm"],
+  },
+  {
+    id: "mi",
+    label: "4. Motivational Interviewing",
+    short: "MI",
+    sdt: "Synthesis",
+    sdtBlurb: "Autonomy, competence, and relatedness don't happen in separate modules in real life. They happen in the same session, often the same exchange. The navigator's job in MI is to hold all three at once, surfacing what the client already brings and working in service of it.",
+    activities: ["open", "affirm", "reflect", "summarize", "synthesis", "llm"],
+  },
+];
+
+// localStorage-backed state hook. Falls back to in-memory if storage is unavailable.
+const STORAGE_KEY = "dhn-training-v1";
+
+function loadState() {
+  try {
+    if (typeof window === "undefined" || !window.localStorage) return {};
+    const raw = window.localStorage.getItem(STORAGE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    // Sets serialize as arrays — restore them
+    return parsed || {};
+  } catch {
+    return {};
+  }
+}
+
+function saveState(state) {
+  try {
+    if (typeof window === "undefined" || !window.localStorage) return;
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+  } catch {
+    // Quota exceeded or storage disabled — silently no-op
+  }
+}
+
+// Per-activity persistent state. Sets are stored as arrays.
+function usePersistentActivity(activityKey, initialValue) {
+  const [value, setValue] = useState(() => {
+    const all = loadState();
+    if (all[activityKey] !== undefined) {
+      return rehydrate(all[activityKey], initialValue);
+    }
+    return initialValue;
+  });
+
+  useEffect(() => {
+    const all = loadState();
+    all[activityKey] = serialize(value);
+    saveState(all);
+  }, [activityKey, value]);
+
+  return [value, setValue];
+}
+
+function serialize(v) {
+  if (v instanceof Set) return { __set: [...v] };
+  if (Array.isArray(v)) return v.map(serialize);
+  if (v && typeof v === "object") {
+    const out = {};
+    for (const k of Object.keys(v)) out[k] = serialize(v[k]);
+    return out;
+  }
+  return v;
+}
+
+function rehydrate(stored, template) {
+  if (stored && typeof stored === "object" && Array.isArray(stored.__set)) {
+    return new Set(stored.__set);
+  }
+  if (template instanceof Set) {
+    // template is a Set but stored isn't — fall back to template
+    return template;
+  }
+  if (Array.isArray(stored)) return stored.map((s, i) => rehydrate(s, template?.[i]));
+  if (stored && typeof stored === "object") {
+    const out = {};
+    for (const k of Object.keys(stored)) out[k] = rehydrate(stored[k], template?.[k]);
+    return out;
+  }
+  return stored;
+}
+
+// Activity completion tracking
+function markActivityDone(moduleId, activityId) {
+  const all = loadState();
+  if (!all.__completed) all.__completed = {};
+  if (!all.__completed[moduleId]) all.__completed[moduleId] = [];
+  if (!all.__completed[moduleId].includes(activityId)) {
+    all.__completed[moduleId].push(activityId);
+    saveState(all);
+  }
+}
+
+function getCompletedActivities(moduleId) {
+  const all = loadState();
+  return new Set((all.__completed && all.__completed[moduleId]) || []);
+}
+
+function clearAllProgress() {
+  try {
+    if (typeof window !== "undefined" && window.localStorage) {
+      window.localStorage.removeItem(STORAGE_KEY);
+    }
+  } catch {}
+}
+
+function hasAnyActivityProgress() {
+  const all = loadState();
+  if (!all || typeof all !== "object") return false;
+  // Anything besides our internal screen/module/completed keys means engagement
+  const keys = Object.keys(all).filter(k => !k.startsWith("__"));
+  return keys.length > 0;
+}
+
+// ============================================================================
+// SHARED PRIMITIVES
+// ============================================================================
+
+function Card({ children, style }) {
+  return (
+    <div style={{ background: WHITE, borderRadius: 14, boxShadow: "0 2px 12px rgba(26,39,68,.07)", padding: 24, marginBottom: 20, ...style }}>
+      {children}
+    </div>
+  );
+}
+
+function Section({ title, children }) {
+  return (
+    <div style={{ marginBottom: 18 }}>
+      <div style={{ fontSize: 15, fontWeight: 700, color: NAVY, marginBottom: 10 }}>{title}</div>
+      {children}
+    </div>
+  );
+}
+
+function Eyebrow({ children, color = TEXT_LIGHT }) {
+  return (
+    <div style={{ fontSize: 11, fontWeight: 700, color, textTransform: "uppercase", letterSpacing: ".06em", marginBottom: 6 }}>
+      {children}
+    </div>
+  );
+}
+
+function Prose({ children }) {
+  return <div style={{ fontSize: 13, color: TEXT_MID, lineHeight: 1.7, marginBottom: 12 }}>{children}</div>;
+}
+
+function Quote({ text, attr }) {
+  return (
+    <div style={{
+      borderLeft: `3px solid ${GOLD}`, background: GOLD_LIGHT,
+      padding: "14px 18px", borderRadius: "0 10px 10px 0", margin: "16px 0",
+      fontSize: 13, color: TEXT, lineHeight: 1.6, fontStyle: "italic",
+    }}>
+      {text}
+      <div style={{ fontSize: 11, color: GOLD_DARK, marginTop: 6, fontStyle: "normal", fontWeight: 600 }}>
+        {attr}
+      </div>
+    </div>
+  );
+}
+
+function ConceptTiles({ tiles, color = TEAL }) {
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: 14, marginBottom: 16 }}>
+      {tiles.map((tile, i) => (
+        <div key={i} style={{ background: WARM, borderRadius: 10, padding: 14, borderLeft: `3px solid ${color}` }}>
+          <div style={{ fontSize: 13, fontWeight: 700, color: NAVY, marginBottom: 6 }}>{tile.h}</div>
+          <div style={{ fontSize: 12, color: TEXT_MID, lineHeight: 1.5 }}>{tile.p}</div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function TagButton({ label, selected, onClick, color, disabled }) {
+  const bg = selected ? (color === "teal" ? TEAL_LIGHT : color === "caution" ? CAUTION_LIGHT : color === "gold" ? GOLD_LIGHT : WARM_DIM) : WHITE;
+  const border = selected ? (color === "teal" ? TEAL : color === "caution" ? CAUTION : color === "gold" ? GOLD : TEXT_LIGHT) : WARM_DIM;
+  const textColor = selected ? (color === "teal" ? TEAL_DARK : color === "caution" ? CAUTION : color === "gold" ? GOLD_DARK : TEXT) : TEXT_LIGHT;
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      style={{
+        padding: "6px 14px",
+        borderRadius: 20,
+        border: `2px solid ${border}`,
+        background: bg,
+        color: textColor,
+        fontSize: 12,
+        fontWeight: 600,
+        cursor: disabled ? "default" : "pointer",
+        transition: "all .15s",
+        margin: 3,
+        fontFamily: "inherit",
+      }}
+    >
+      {label}
+    </button>
+  );
+}
+
+function InfoBubble({ title, children }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div style={{ marginTop: 16, marginBottom: 12, border: `1.5px solid ${open ? TEAL : WARM_DIM}`, borderRadius: 10, overflow: "hidden", transition: "border-color .15s" }}>
+      <button
+        onClick={() => setOpen(!open)}
+        style={{
+          width: "100%", textAlign: "left", padding: "12px 16px",
+          border: "none", background: open ? TEAL_LIGHT : WHITE,
+          cursor: "pointer", display: "flex", alignItems: "center", gap: 10,
+          transition: "background .15s", fontFamily: "inherit",
+        }}
+      >
+        <div style={{
+          width: 24, height: 24, borderRadius: "50%",
+          background: open ? TEAL : WARM_DIM,
+          display: "flex", alignItems: "center", justifyContent: "center",
+          flexShrink: 0, transition: "background .15s",
+        }}>
+          <span style={{ fontSize: 13, fontWeight: 700, color: open ? WHITE : TEXT_LIGHT, lineHeight: 1 }}>i</span>
+        </div>
+        <div style={{ fontSize: 14, fontWeight: 600, color: open ? TEAL_DARK : TEXT, flex: 1 }}>{title}</div>
+        <svg
+          width="14" height="14" viewBox="0 0 24 24" fill="none"
+          stroke={open ? TEAL_DARK : TEXT_LIGHT} strokeWidth="2" strokeLinecap="round"
+          style={{ transform: open ? "rotate(180deg)" : "rotate(0deg)", transition: "transform .2s", flexShrink: 0 }}
+        >
+          <polyline points="6 9 12 15 18 9" />
+        </svg>
+      </button>
+      {open && (
+        <div style={{ padding: "14px 16px", borderTop: `1px solid ${TEAL}`, background: WHITE, fontSize: 13, color: TEXT_MID, lineHeight: 1.6 }}>
+          {children}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SuggestedReveal({ show, title = "Suggested approach", children }) {
+  if (!show) return null;
+  return (
+    <div style={{ marginTop: 16 }}>
+      <div style={{ background: TEAL_LIGHT, border: `1px solid ${TEAL}`, borderRadius: 12, padding: 20, animation: "fadeIn .3s ease" }}>
+        <div style={{ fontSize: 11, fontWeight: 700, color: TEAL_DARK, textTransform: "uppercase", letterSpacing: ".06em", marginBottom: 10 }}>
+          {title}
+        </div>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+function ActivityWrap({ children }) {
+  return (
+    <div style={{ marginBottom: 28 }}>
+      <div style={{
+        background: NAVY, color: WHITE, borderRadius: "12px 12px 0 0",
+        padding: "12px 20px", fontSize: 11, fontWeight: 700,
+        letterSpacing: ".06em", textTransform: "uppercase",
+      }}>
+        Interactive activity
+      </div>
+      <div style={{
+        background: WHITE, borderRadius: "0 0 12px 12px",
+        border: `1px solid ${WARM_DIM}`, borderTop: "none", padding: 20,
+      }}>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+function ActivityHead({ title, instructions }) {
+  return (
+    <>
+      <div style={{ fontSize: 15, fontWeight: 700, color: NAVY, marginBottom: 4 }}>{title}</div>
+      <div style={{ fontSize: 13, color: TEXT_MID, marginBottom: 20, lineHeight: 1.6 }}>{instructions}</div>
+    </>
+  );
+}
+
+function SubmitBtn({ onClick, disabled, label = "Submit", submittedLabel = "Submitted" }) {
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      style={{
+        padding: "12px 26px", borderRadius: 12, border: "none",
+        background: disabled ? WARM_DIM : TEAL,
+        color: disabled ? TEXT_LIGHT : WHITE,
+        fontSize: 14, fontWeight: 600,
+        cursor: disabled ? "default" : "pointer",
+        fontFamily: "inherit",
+      }}
+    >
+      {disabled ? submittedLabel : label}
+    </button>
+  );
+}
+
+function TextArea({ value, onChange, placeholder, disabled, minHeight = 60 }) {
+  return (
+    <textarea
+      value={value || ""}
+      onChange={(e) => !disabled && onChange(e.target.value)}
+      disabled={disabled}
+      placeholder={placeholder}
+      style={{
+        width: "100%", padding: "10px 12px",
+        border: `1.5px solid ${WARM_DIM}`, borderRadius: 8,
+        fontSize: 13, fontFamily: "inherit", resize: "vertical",
+        minHeight, lineHeight: 1.5, boxSizing: "border-box",
+        background: disabled ? WARM : WHITE, color: TEXT,
+      }}
+    />
+  );
+}
+
+function TextInput({ value, onChange, placeholder, disabled }) {
+  return (
+    <input
+      type="text"
+      value={value || ""}
+      onChange={(e) => !disabled && onChange(e.target.value)}
+      disabled={disabled}
+      placeholder={placeholder}
+      style={{
+        width: "100%", padding: "10px 12px",
+        border: `1.5px solid ${WARM_DIM}`, borderRadius: 8,
+        fontSize: 13, fontFamily: "inherit",
+        boxSizing: "border-box",
+        background: disabled ? WARM : WHITE, color: TEXT,
+      }}
+    />
+  );
+}
+
+// ============================================================================
+// THROUGH-LINE CLIENT
+// One persona that recurs across modules so the training has continuity.
+// ============================================================================
+
+const MAYA = {
+  name: "Maya",
+  intro: "Maya is a 58-year-old who recently started receiving care at a community health center. She works retail, has a smartphone she's had for two years, and has never used a patient portal. Her primary care doctor referred her to digital navigation because she keeps missing the patient portal messages about her diabetes labs. She's described herself as 'not a tech person.'",
+  byModule: {
+    troubleshooting: "In Module 1 you'll meet Maya for the first time. She's coming to you because she can't log into her MyChart account, but the device tells her there's not enough storage to install it.",
+    competence: "Maya's portal is set up. Now she wants to learn to use it. The literacy gap is wider than the login problem suggested: she's never sent an attachment, and she's nervous about clicking the wrong thing.",
+    relatedness: "Her doctor has suggested a diabetes self-management app. You're the one who introduces it. Maya is skeptical: her last experience with 'helpful technology' (the portal) was frustrating.",
+    mi: "By the time Maya arrives for her fourth session, her relationship with technology is shifting but fragile. Some of your earlier interactions with her went well; some didn't. This module is where you go back and look at what would have helped.",
+  },
+};
+
+// Human-readable activity labels for the per-module progress checklist
+const ACTIVITY_LABELS = {
+  troubleshooting: {
+    "resource-guide": "Build a resource guide",
+    "scenarios":      "Three troubleshooting scenarios",
+    "llm":            "AI chatbot practice",
+  },
+  competence: {
+    "explain":        "Explain a simple concept",
+    "match":          "Match clients to DOORS modules",
+    "chunk":          "Chunking practice",
+    "llm":            "AI chatbot practice",
+  },
+  relatedness: {
+    "keyphrase":      "Hearing both layers",
+    "health-goals":   "Health Goals Survey",
+    "use-plan":       "Use Plan",
+    "llm":            "AI chatbot practice",
+  },
+  mi: {
+    "open":           "OARS — open-ended questions",
+    "affirm":         "OARS — affirmations vs. praise",
+    "reflect":        "OARS — reflective listening",
+    "summarize":      "OARS — summaries",
+    "synthesis":      "Synthesis — redo with MI",
+    "llm":            "AI chatbot practice",
+  },
+};
+
+function ModuleOrientation({ moduleObj, completedActivities }) {
+  const labels = ACTIVITY_LABELS[moduleObj.id] || {};
+  const activityIds = moduleObj.activities || [];
+
+  return (
+    <div style={{
+      background: `linear-gradient(135deg, ${TEAL_LIGHT} 0%, ${WARM} 100%)`,
+      border: `1px solid ${WARM_DIM}`,
+      borderRadius: 14, padding: 22, marginBottom: 24,
+    }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10, flexWrap: "wrap" }}>
+        <div style={{
+          padding: "4px 10px", borderRadius: 14, background: TEAL,
+          color: WHITE, fontSize: 10, fontWeight: 700, letterSpacing: ".08em", textTransform: "uppercase",
+        }}>
+          {moduleObj.sdt}
+        </div>
+        <div style={{ fontSize: 11, color: TEXT_LIGHT, fontWeight: 600 }}>
+          The Self-Determination Theory orientation for this module
+        </div>
+      </div>
+      <div style={{ fontSize: 13, color: TEXT_MID, lineHeight: 1.7, marginBottom: 14 }}>
+        {moduleObj.sdtBlurb}
+      </div>
+      <div style={{
+        background: WHITE, borderRadius: 10, padding: 14,
+        borderLeft: `3px solid ${GOLD}`,
+        marginBottom: 14,
+      }}>
+        <div style={{ fontSize: 11, fontWeight: 700, color: GOLD_DARK, textTransform: "uppercase", letterSpacing: ".06em", marginBottom: 6 }}>
+          Where Maya is now
+        </div>
+        <div style={{ fontSize: 13, color: TEXT, lineHeight: 1.6 }}>
+          {MAYA.byModule[moduleObj.id]}
+        </div>
+      </div>
+
+      <div style={{ background: WHITE, borderRadius: 10, padding: 14 }}>
+        <div style={{ fontSize: 11, fontWeight: 700, color: TEXT_LIGHT, textTransform: "uppercase", letterSpacing: ".06em", marginBottom: 8 }}>
+          Activities in this module
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          {activityIds.map((aid) => {
+            const done = completedActivities.has(aid);
+            return (
+              <div key={aid} style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                <div style={{
+                  width: 18, height: 18, borderRadius: "50%",
+                  background: done ? TEAL : WHITE,
+                  border: `1.5px solid ${done ? TEAL : WARM_DIM}`,
+                  display: "flex", alignItems: "center", justifyContent: "center",
+                  flexShrink: 0,
+                }}>
+                  {done && (
+                    <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke={WHITE} strokeWidth="3.5" strokeLinecap="round" strokeLinejoin="round">
+                      <polyline points="20 6 9 17 4 12"/>
+                    </svg>
+                  )}
+                </div>
+                <div style={{ fontSize: 12, color: done ? TEXT_MID : TEXT_LIGHT, textDecoration: done ? "line-through" : "none" }}>
+                  {labels[aid] || aid}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================================
+// AUDIO INFRASTRUCTURE
+// ============================================================================
+// To add a Cloudflare R2 or Google Drive audio link:
+// 1. Upload MP3 to R2 (preferred) or to Google Drive with "Anyone with the link"
+// 2. For R2, the URL is `${R2_BASE}/filename.mp3`
+// 3. For Drive, use https://drive.google.com/uc?export=download&id=FILE_ID
+// Set src to null to show the upload interface instead.
+
+const R2_BASE = "https://pub-PLACEHOLDER.r2.dev";
+
+const moduleAudioSrc = {
+  troubleshooting: null,
+  competence:      null,
+  relatedness:     null,
+  mi:              null,
+};
+
+const defaultLectures = [
+  { id: "lecture_1", title: "Self-Determination Theory in Digital Health Navigation", speaker: "Speaker Name, PhD", affiliation: "Institution", duration: "15 min", description: "An overview of how autonomy, competence, and relatedness frame the navigator role, with examples drawn from clinical practice.", src: null },
+  { id: "lecture_2", title: "Motivational Interviewing for Non-Clinicians", speaker: "Speaker Name, LCSW", affiliation: "Institution", duration: "18 min", description: "How OARS skills translate into the navigator-client relationship, including common pitfalls when MI is applied outside its original substance-use context.", src: null },
+  { id: "lecture_3", title: "The DOORS Curriculum and Digital Literacy as Social Determinant", speaker: "Speaker Name, MD", affiliation: "Institution", duration: "12 min", description: "Background on the DOORS curriculum, the case for digital literacy as a social determinant of health, and what navigators can and cannot accomplish.", src: null },
+  { id: "lecture_4", title: "Working with Older Adults and Technology", speaker: "Speaker Name, MSW", affiliation: "Institution", duration: "20 min", description: "Practical guidance for navigators working with older adults, including pacing, terminology, and the relational work of de-shaming.", src: null },
+];
+
+function AudioPlayer({ moduleId, src }) {
+  const [localAudioUrl, setLocalAudioUrl] = useState(null);
+  const [fileName, setFileName] = useState(null);
+  const [srcError, setSrcError] = useState(false);
+  const [audioReady, setAudioReady] = useState(false);
+  const inputRef = useRef();
+  const audioRef = useRef();
+  const errorTimerRef = useRef(null);
+
+  // Reset error state when src changes (module switch)
+  useEffect(() => {
+    setSrcError(false);
+    setAudioReady(false);
+    if (errorTimerRef.current) clearTimeout(errorTimerRef.current);
+  }, [src]);
+
+  const handleFile = (e) => {
+    const file = e.target.files[0];
+    if (file) {
+      setLocalAudioUrl(URL.createObjectURL(file));
+      setFileName(file.name);
+    }
+  };
+
+  const handleError = () => {
+    if (src && !audioReady) {
+      if (errorTimerRef.current) clearTimeout(errorTimerRef.current);
+      errorTimerRef.current = setTimeout(() => {
+        if (!audioReady) setSrcError(true);
+      }, 2000);
+    }
+  };
+
+  const handleCanPlay = () => {
+    setAudioReady(true);
+    setSrcError(false);
+    if (errorTimerRef.current) clearTimeout(errorTimerRef.current);
+  };
+
+  const activeUrl = (src && !srcError) ? src : localAudioUrl;
+  const hasConfiguredSrc = src && !srcError;
+
+  return (
+    <div style={{ background: NAVY, borderRadius: 12, padding: "16px 20px", marginBottom: 24 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: activeUrl ? 12 : 0 }}>
+        <div style={{ width: 32, height: 32, borderRadius: 8, background: TEAL, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+        </div>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ color: "rgba(255,255,255,.5)", fontSize: 11, fontWeight: 600, letterSpacing: ".06em", textTransform: "uppercase", marginBottom: 2 }}>Module audio</div>
+          {hasConfiguredSrc ? (
+            <div style={{ color: "rgba(255,255,255,.85)", fontSize: 13 }}>Pre-loaded</div>
+          ) : fileName ? (
+            <div style={{ color: "rgba(255,255,255,.85)", fontSize: 13 }}>{fileName}</div>
+          ) : (
+            <div style={{ color: "rgba(255,255,255,.4)", fontSize: 13 }}>No audio uploaded yet</div>
+          )}
+        </div>
+        {!hasConfiguredSrc && (
+          <button onClick={() => inputRef.current?.click()} style={{ background: "rgba(255,255,255,.1)", border: "1.5px solid rgba(255,255,255,.25)", color: "white", fontSize: 11, fontWeight: 600, padding: "6px 14px", borderRadius: 20, cursor: "pointer", letterSpacing: ".04em", fontFamily: "inherit" }}>
+            {localAudioUrl ? "Replace" : "Upload"}
+          </button>
+        )}
+        <input ref={inputRef} type="file" accept="audio/*" onChange={handleFile} style={{ display: "none" }} />
+      </div>
+      {activeUrl && (
+        <audio ref={audioRef} controls src={activeUrl} onError={handleError} onCanPlay={handleCanPlay} style={{ width: "100%", height: 36, borderRadius: 8 }} />
+      )}
+      {srcError && (
+        <div style={{ marginTop: 8, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+          <div style={{ fontSize: 11, color: "rgba(255,255,255,.4)" }}>Pre-configured audio failed to load</div>
+          <button onClick={() => inputRef.current?.click()} style={{ background: "rgba(255,255,255,.1)", border: "1px solid rgba(255,255,255,.2)", color: "white", fontSize: 11, padding: "4px 12px", borderRadius: 16, cursor: "pointer", fontFamily: "inherit" }}>Upload instead</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function LectureCard({ lecture }) {
+  const [localAudioUrl, setLocalAudioUrl] = useState(null);
+  const [fileName, setFileName] = useState(null);
+  const [srcError, setSrcError] = useState(false);
+  const [expanded, setExpanded] = useState(false);
+  const inputRef = useRef();
+  const handleFile = (e) => {
+    const file = e.target.files[0];
+    if (file) { setLocalAudioUrl(URL.createObjectURL(file)); setFileName(file.name); }
+  };
+
+  const activeUrl = (lecture.src && !srcError) ? lecture.src : localAudioUrl;
+  const hasConfiguredSrc = lecture.src && !srcError;
+
+  return (
+    <div style={{ background: WHITE, borderRadius: 14, boxShadow: "0 2px 12px rgba(26,39,68,.07)", overflow: "hidden", marginBottom: 16 }}>
+      <div onClick={() => setExpanded(!expanded)} style={{ padding: "18px 20px", cursor: "pointer", display: "flex", alignItems: "flex-start", gap: 14 }}>
+        <div style={{ width: 44, height: 44, borderRadius: 10, background: expanded ? TEAL : WARM_DIM, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, transition: "background .2s" }}>
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke={expanded ? "white" : TEXT_LIGHT} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
+        </div>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 2 }}>
+            <div style={{ fontSize: 15, fontWeight: 700, color: NAVY }}>{lecture.title}</div>
+            {hasConfiguredSrc && <span style={{ fontSize: 9, fontWeight: 700, padding: "2px 6px", borderRadius: 6, background: TEAL_LIGHT, color: TEAL_DARK }}>AUDIO</span>}
+          </div>
+          <div style={{ fontSize: 13, color: TEXT_MID }}>{lecture.speaker}</div>
+          <div style={{ fontSize: 12, color: TEXT_LIGHT }}>{lecture.affiliation}</div>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
+          <span style={{ fontSize: 11, fontWeight: 600, color: TEXT_LIGHT, background: WARM_DIM, padding: "3px 10px", borderRadius: 10 }}>{lecture.duration}</span>
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke={TEXT_LIGHT} strokeWidth="2" strokeLinecap="round" style={{ transform: expanded ? "rotate(180deg)" : "rotate(0deg)", transition: "transform .2s" }}><polyline points="6 9 12 15 18 9"/></svg>
+        </div>
+      </div>
+      {expanded && (
+        <div style={{ padding: "0 20px 20px", borderTop: `1px solid ${WARM_DIM}` }}>
+          <div style={{ fontSize: 13, color: TEXT_MID, lineHeight: 1.6, padding: "14px 0" }}>{lecture.description}</div>
+          <div style={{ background: NAVY, borderRadius: 10, padding: "14px 16px" }}>
+            {activeUrl ? (
+              <div>
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
+                  <div style={{ fontSize: 12, color: "rgba(255,255,255,.7)" }}>{hasConfiguredSrc ? "Pre-loaded audio" : fileName}</div>
+                  {!hasConfiguredSrc && (
+                    <button onClick={(e) => { e.stopPropagation(); inputRef.current?.click(); }} style={{ background: "rgba(255,255,255,.1)", border: "1px solid rgba(255,255,255,.2)", color: "white", fontSize: 11, padding: "4px 12px", borderRadius: 16, cursor: "pointer", fontFamily: "inherit" }}>Replace</button>
+                  )}
+                </div>
+                <audio controls src={activeUrl} onError={() => { if (lecture.src) setSrcError(true); }} style={{ width: "100%", height: 36 }} />
+              </div>
+            ) : (
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                <div style={{ fontSize: 12, color: "rgba(255,255,255,.4)" }}>No audio uploaded yet</div>
+                <button onClick={(e) => { e.stopPropagation(); inputRef.current?.click(); }} style={{ background: TEAL, border: "none", color: WHITE, fontSize: 12, fontWeight: 600, padding: "8px 18px", borderRadius: 20, cursor: "pointer", fontFamily: "inherit" }}>Upload audio</button>
+              </div>
+            )}
+            {srcError && (
+              <div style={{ marginTop: 8, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                <div style={{ fontSize: 11, color: "rgba(255,255,255,.4)" }}>Pre-configured audio failed to load</div>
+                <button onClick={(e) => { e.stopPropagation(); inputRef.current?.click(); }} style={{ background: "rgba(255,255,255,.1)", border: "1px solid rgba(255,255,255,.2)", color: "white", fontSize: 11, padding: "4px 12px", borderRadius: 16, cursor: "pointer", fontFamily: "inherit" }}>Upload instead</button>
+              </div>
+            )}
+            <input ref={inputRef} type="file" accept="audio/*" onChange={handleFile} style={{ display: "none" }} />
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SupplementalLectures() {
+  return (
+    <div>
+      <div style={{ marginBottom: 24 }}>
+        <div style={{ fontSize: 11, fontWeight: 700, color: TEXT_LIGHT, textTransform: "uppercase", letterSpacing: ".06em", marginBottom: 4 }}>Supplemental content</div>
+        <h1 style={{ fontSize: 22, fontWeight: 700, color: NAVY, margin: 0 }}>Expert lectures</h1>
+        <div style={{ fontSize: 13, color: TEXT_MID, lineHeight: 1.6, marginTop: 8 }}>
+          Contributed audio lectures from clinicians and researchers in digital health navigation. Each lecture covers a specific aspect of the navigator role in 10-20 minutes.
+        </div>
+      </div>
+      {defaultLectures.map((lec) => (
+        <LectureCard key={lec.id} lecture={lec} />
+      ))}
+      <Card style={{ background: WARM, border: `2px dashed ${WARM_DIM}`, boxShadow: "none", textAlign: "center", padding: 32 }}>
+        <div style={{ fontSize: 13, color: TEXT_LIGHT, lineHeight: 1.6 }}>
+          Additional lectures can be added by editing the configuration file.<br />
+          Each entry needs a title, speaker, affiliation, duration, and description.
+        </div>
+      </Card>
+    </div>
+  );
+}
+
+// ============================================================================
+// LLM PRACTICE LAUNCHER
+// ============================================================================
+
+const LLM_PROMPTS = {
+  troubleshooting: `You are my client, and I am a Digital Health Navigator-in-training.
+
+Please role-play a realistic technical-support scenario that you might experience as a patient trying to use a digital-health tool. Begin by describing a short scenario (for example, "I'm trying to log in to my patient portal, but it keeps saying my password is wrong").
+
+As the client, you should:
+- Present the problem in a natural, conversational way, including any confusion, frustration, or missing information a real client might have.
+- Answer my questions as I try to define the problem.
+- React as I guide you step-by-step through a solution, showing realistic levels of understanding or difficulty.
+- Allow me to coach you toward digital autonomy. For example, by explaining what to do if this issue happens again or how to find help in the future.
+
+When the exercise ends, please qualitatively evaluate my performance on these criteria:
+1. Questioning the client: Did I ask clear, open questions?
+2. Defining the problem: Did I clearly define the problem?
+3. Connecting with a resource: Did I look up or suggest an appropriate solution?
+4. Guiding through the solution: Did I communicate steps clearly and patiently?
+5. Promoting digital autonomy: Did I empower you to solve similar problems independently?
+
+Randomly choose one of these common issues to start with (or create a new one):
+- Trouble logging into a patient portal (e.g., MyChart).
+- Difficulty adjusting accessibility settings (text size, screen reader).
+- Problem joining a telehealth appointment on Zoom.
+- Confusion about installing a health app on a smartphone.
+- Resetting a device password or connecting to Wi-Fi.
+
+Please act naturally and stay in character as the client until I indicate we've finished.`,
+
+  competence: `You are simulating a practice session for digital navigators. The trainee (user) is learning how to guide clients through teaching basic digital skills in a clear, supportive, and step-by-step manner.
+
+Your Role:
+- You are the client, someone who is seeking to learn a basic digital skill (for example, "What is email and how do I use it?"). You should:
+- Ask realistic, clarifying questions when you don't understand something.
+- Sometimes express mild confusion or frustration in a polite way, so the trainee practices empathy and reassurance.
+- Respond conversationally, as a real client might.
+
+Trainee's Role:
+- The trainee (user) acts as a digital navigator, explaining the technical concept and guiding you through it step-by-step in a friendly, patient, and encouraging way.
+
+Practice Scenario Setup:
+Begin by saying: "Hi! I'm trying to learn more about [chosen digital skill, e.g., email]. Can you help me understand how to use it?"
+
+During the conversation:
+- Ask at least 2–3 clarifying questions.
+- Occasionally ask for repetition or rephrasing if something is unclear.
+- Acknowledge when you understand something or feel more confident.
+
+After the conversation ends (when the trainee says something like "That's all for today" or "Does that make sense?"), provide detailed feedback with the following structure:
+
+Feedback Report:
+- Clarity of Explanation: Was the information accurate, structured, and easy to follow?
+- Identification of Needs: Did the trainee notice what I was confused about and adjust accordingly?
+- Empathy and Support: Did the trainee's tone make me feel supported and comfortable asking questions?
+- Overall Strengths: What did they do particularly well?
+- Areas for Improvement: What could make their next explanation even clearer or more supportive?
+
+End your feedback by offering one sentence of encouragement.`,
+
+  relatedness: `You are taking the role of a client who is looking for a Digital Health Tool. I am a Digital Health Navigator whose job is to connect you with a Digital Health Tool. Roleplay with me in which I guide you to the selection of a Digital Health Tool. Select one of the following client roles at random:
+
+Client Role Card #1
+- You work late shifts and have trouble falling asleep.
+- You've been feeling stressed, especially since your mother got sick.
+- You've tried watching YouTube videos but don't know if they help.
+- You want something more structured to help you sleep better.
+- "I just want to get a good night's sleep without feeling overwhelmed all the time."
+
+Client Role Card #2
+- You have been feeling more emotional than usual lately.
+- Your doctor mentioned mood tracking but you don't know where to start.
+- You're hesitant with technology and use a basic Android phone.
+- "I don't need a diagnosis. I just want to understand what's going on with me day to day."
+
+Client Role Card #3
+- You feel nervous in crowded spaces and often feel your heart race.
+- You prefer reading in Spanish but speak English.
+- Your son helped you set up a phone, but you don't use it much.
+- "I want to feel calmer, but I don't know what to search for or how to find things in Spanish."
+
+Client Role Card #4
+- You struggle to stay focused and complete tasks.
+- You've never been diagnosed with ADHD, but you relate to the symptoms.
+- You want tools to stay organized but get overwhelmed by apps.
+- "I always start things and never finish. I need help staying on track."
+
+Open the conversation with dialogue that gives some hint as to what you might need.
+
+Do not reveal your full situation or needs upfront. Let me ask questions to uncover the details gradually. Do not just give away all the information, force me to ask questions if necessary. Do not provide out-of-character hints. React appropriately if I am rude or dismissive of your concerns. Do not restrict your willingness to disagree with or argue with me as appropriate.
+
+During the roleplay scenario, remain fully in character as the client at all times, and do not break character to give feedback unless the roleplay is explicitly ended by me. Only respond as a client describing your needs, concerns, and situation. When the conversation reaches the point of an app match or is ended by me, provide feedback on my performance.`,
+
+  mi: `You are a trainer for Motivational Interviewing (MI) skills, focusing on OARS principles (Open-ended questions, Affirmations, Reflective listening, Summarizing).
+
+1. Roleplay as a client persona in a given scenario. Respond only as the client, with natural emotions and conversational tone.
+
+Start by asking me which scenario I'd like to practice, or if I'd like you to generate a new prompt:
+- Scenario 1: Zoom Setup – A 65-year-old who feels frustrated trying to install Zoom.
+- Scenario 2: Wi-Fi Troubles – A 45-year-old parent stressed about unreliable home Wi-Fi.
+- Scenario 3: Mental Health App Hesitation – A 28-year-old skeptical about using a mental health app, feeling it implies they are "weak" or "broken."
+
+After I pick a scenario, also ask me to choose the difficulty level (Easy, Moderate, Hard). Difficulty affects how resistant or open the client persona will be:
+- Easy: Client is cooperative, open to reflection, and willing to engage.
+- Moderate: Client is mixed, showing some resistance, hesitations, or defensiveness.
+- Hard: Client is resistant, curt, defensive, and difficult to engage, testing advanced MI skills.
+
+Stay in character fully, adapting responses to the chosen difficulty level. Give realistic resistance, hesitations, or mixed emotions to challenge MI skills.
+
+After our conversation concludes at my request, provide detailed analysis of my application of OARS. Be critical and precise in your feedback: identify specific missed opportunities, vague questions, ineffective affirmations, or moments where reflections could have been deeper. Point out where I may have fallen into advice-giving, closed questioning, or over-sympathizing. Keep praise minimal and only when clearly deserved. Additionally, evaluate how effectively I managed the chosen difficulty level, including whether my techniques were appropriate for the level of client resistance or openness.
+
+The goal is constructive critique that helps sharpen MI skills.`,
+};
+
+function LLMLauncher({ moduleId, blurb }) {
+  const [copied, setCopied] = useState(false);
+  const [reflection, setReflection] = usePersistentActivity(`${moduleId}:llm:reflection`, {
+    didIt: "",
+    surfaced: "",
+    feedback: "",
+    nextTime: "",
+  });
+  const [reflectionSaved, setReflectionSaved] = usePersistentActivity(`${moduleId}:llm:saved`, false);
+  const prompt = LLM_PROMPTS[moduleId];
+
+  const setKey = (k, v) => setReflection({ ...reflection, [k]: v });
+
+  const onSaveReflection = () => {
+    setReflectionSaved(true);
+    markActivityDone(moduleId, "llm");
+  };
+
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(prompt);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2200);
+    } catch {
+      const ta = document.createElement("textarea");
+      ta.value = prompt;
+      document.body.appendChild(ta);
+      ta.select();
+      try { document.execCommand("copy"); } catch {}
+      document.body.removeChild(ta);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2200);
+    }
+  };
+
+  const services = [
+    { name: "Claude",  url: "https://claude.ai/new",            color: "#d97757" },
+    { name: "ChatGPT", url: "https://chat.openai.com/",         color: "#10a37f" },
+    { name: "Gemini",  url: "https://gemini.google.com/app",    color: "#4285f4" },
+  ];
+
+  return (
+    <ActivityWrap>
+      <ActivityHead
+        title="Asynchronous practice with an AI chatbot"
+        instructions={blurb}
+      />
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 14, flexWrap: "wrap" }}>
+        <button
+          onClick={copy}
+          style={{
+            padding: "10px 16px", borderRadius: 10, border: `2px solid ${copied ? TEAL : NAVY}`,
+            background: copied ? TEAL_LIGHT : WHITE, color: copied ? TEAL_DARK : NAVY,
+            fontSize: 13, fontWeight: 600, cursor: "pointer", fontFamily: "inherit",
+            display: "inline-flex", alignItems: "center", gap: 8,
+          }}
+        >
+          {copied ? (
+            <>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+              Prompt copied
+            </>
+          ) : (
+            <>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+              Copy practice prompt
+            </>
+          )}
+        </button>
+        <span style={{ fontSize: 12, color: TEXT_LIGHT, marginLeft: 4 }}>then open one:</span>
+        {services.map((s) => (
+          <a
+            key={s.name}
+            href={s.url}
+            target="_blank"
+            rel="noopener noreferrer"
+            style={{
+              padding: "8px 14px", borderRadius: 10, border: `1.5px solid ${WARM_DIM}`,
+              background: WHITE, color: TEXT_MID, fontSize: 12, fontWeight: 600,
+              textDecoration: "none", display: "inline-flex", alignItems: "center", gap: 6,
+              transition: "border-color .15s",
+            }}
+            onMouseEnter={(e) => e.currentTarget.style.borderColor = s.color}
+            onMouseLeave={(e) => e.currentTarget.style.borderColor = WARM_DIM}
+          >
+            {s.name}
+            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+          </a>
+        ))}
+      </div>
+
+      <div style={{ fontSize: 11, color: TEXT_LIGHT, marginBottom: 14, lineHeight: 1.6 }}>
+        Note on services: Claude tends to give the most critical, specific feedback for these practice sessions. ChatGPT runs warmer. Gemini varies. If you want to be pushed, try Claude first.
+      </div>
+
+      <details style={{ borderTop: `1px solid ${WARM_DIM}`, paddingTop: 12, marginBottom: 18 }}>
+        <summary style={{
+          cursor: "pointer", fontSize: 12, color: TEXT_LIGHT, fontWeight: 600,
+          listStyle: "none", display: "inline-block",
+        }}>
+          Preview the prompt
+        </summary>
+        <pre style={{
+          marginTop: 10, padding: 14, background: WARM, borderRadius: 8,
+          fontSize: 11, fontFamily: "'DM Mono', monospace", color: TEXT_MID,
+          whiteSpace: "pre-wrap", lineHeight: 1.5, maxHeight: 280, overflow: "auto",
+        }}>
+          {prompt}
+        </pre>
+      </details>
+
+      <div style={{
+        background: WARM, borderRadius: 10, padding: 16, marginTop: 8,
+      }}>
+        <div style={{ fontSize: 13, fontWeight: 700, color: NAVY, marginBottom: 8 }}>
+          After your practice session, come back here
+        </div>
+        <div style={{ fontSize: 12, color: TEXT_MID, lineHeight: 1.6, marginBottom: 14 }}>
+          The point of the LLM evaluation isn't the score. The point is noticing what you did and didn't do. Use these prompts after your session to extract the learning.
+        </div>
+
+        <div style={{ marginBottom: 12 }}>
+          <Eyebrow>Did you complete a practice session?</Eyebrow>
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+            {["Yes", "Started but didn't finish", "Not yet"].map((opt) => (
+              <button
+                key={opt}
+                onClick={() => !reflectionSaved && setKey("didIt", opt)}
+                disabled={reflectionSaved}
+                style={{
+                  padding: "7px 14px", borderRadius: 8,
+                  border: `1.5px solid ${reflection.didIt === opt ? TEAL : WARM_DIM}`,
+                  background: reflection.didIt === opt ? TEAL_LIGHT : WHITE,
+                  color: reflection.didIt === opt ? TEAL_DARK : TEXT_LIGHT,
+                  fontSize: 12, fontWeight: 600,
+                  cursor: reflectionSaved ? "default" : "pointer",
+                  fontFamily: "inherit",
+                }}
+              >
+                {opt}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div style={{ marginBottom: 12 }}>
+          <Eyebrow>What surprised you about how the LLM played the client?</Eyebrow>
+          <TextArea
+            value={reflection.surfaced}
+            onChange={(v) => setKey("surfaced", v)}
+            disabled={reflectionSaved}
+            placeholder="A reaction you didn't expect, a question you couldn't anticipate..."
+            minHeight={50}
+          />
+        </div>
+
+        <div style={{ marginBottom: 12 }}>
+          <Eyebrow>What's one specific thing the feedback called out?</Eyebrow>
+          <TextArea
+            value={reflection.feedback}
+            onChange={(v) => setKey("feedback", v)}
+            disabled={reflectionSaved}
+            placeholder="Be concrete. Not 'I should ask better questions' but 'at message 4 I jumped to a solution before defining the problem.'"
+            minHeight={50}
+          />
+        </div>
+
+        <div style={{ marginBottom: 12 }}>
+          <Eyebrow>What will you do differently next time?</Eyebrow>
+          <TextArea
+            value={reflection.nextTime}
+            onChange={(v) => setKey("nextTime", v)}
+            disabled={reflectionSaved}
+            placeholder="One change, named specifically..."
+            minHeight={50}
+          />
+        </div>
+
+        <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 8 }}>
+          <SubmitBtn onClick={onSaveReflection} disabled={reflectionSaved} label="Save reflection" submittedLabel="Saved" />
+        </div>
+      </div>
+    </ActivityWrap>
+  );
+}
+
+// ============================================================================
+// MODULE 1 — TROUBLESHOOTING & DIGITAL AUTONOMY
+// ============================================================================
+
+function TroubleshootingConcepts() {
+  return (
+    <Card>
+      <Section title="The role of the Digital Health Navigator">
+        <Prose>
+          A Digital Health Navigator helps clients use technology in service of their care. The role exists because the digital divide (uneven access to technology and the skills to use it) produces real clinical consequences. Patients who can't access a portal don't see their labs, don't message their doctor, and don't make their telehealth visits. The United Nations classifies digital literacy as a Sustainable Development goal; some health researchers now treat it as a social determinant of health.
+        </Prose>
+        <Prose>
+          Across a session, navigators do four things: connect clients to resources (devices, broadband, subsidized plans), troubleshoot technology, deliver digital literacy training, and support the use of digital health tools. This module covers the first two.
+        </Prose>
+      </Section>
+
+      <Section title="Why this training is structured the way it is">
+        <Prose>
+          The four modules follow a framework from psychology called <strong>Self-Determination Theory</strong>, developed by Richard Ryan and Edward Deci. The theory says that durable, intrinsic motivation, the kind that survives a person actually living their life, depends on three things: <strong>autonomy</strong> (a sense of agency and self-direction), <strong>competence</strong> (a sense of capability and growth), and <strong>relatedness</strong> (a sense of connection to other people).
+        </Prose>
+        <Prose>
+          That framework is why this isn't a technical-support training. A purely technical approach can solve today's problem and still leave the client feeling smaller, more dependent, and more alienated from their device than when they walked in. The point of Digital Navigation work is the opposite: to leave the client more able to act, more confident in their growing skill, and more connected to a person who has their back. Each module names one of those three. The fourth, Motivational Interviewing, is where you learn to hold all three at once.
+        </Prose>
+      </Section>
+
+      <div style={{
+        background: TEAL_LIGHT, border: `1px solid ${TEAL}`,
+        borderRadius: 10, padding: 16, marginBottom: 18,
+      }}>
+        <div style={{ fontSize: 11, fontWeight: 700, color: TEAL_DARK, textTransform: "uppercase", letterSpacing: ".06em", marginBottom: 8 }}>
+          Why this module is about autonomy
+        </div>
+        <div style={{ fontSize: 13, color: TEXT, lineHeight: 1.7 }}>
+          Troubleshooting is the most common moment in navigator work where the temptation to take over is strongest. The client is stuck, you can see the answer, the fix would take you twenty seconds. <em>Don't.</em> The session where you fix it for them and the session where you build their autonomy can look almost identical from the outside, but they leave the client in completely different places. This module is about learning to feel the difference and choose the second one, even when it costs you time.
+        </div>
+      </div>
+
+      <Quote
+        text="Liberating education consists in acts of cognition, not transferrals of information."
+        attr="Paulo Freire, Pedagogy of the Oppressed"
+      />
+
+      <Prose>
+        Freire's distinction is the through-line for this module. A navigator's job isn't to fix the device. The job is to help the client encounter and resolve technical problems on their own. Every session is an opportunity to build <strong>digital autonomy</strong>: the capacity to use technology without external support for self-defined purposes.
+      </Prose>
+
+      <Section title="The three-step troubleshooting process">
+        <ConceptTiles tiles={[
+          { h: "1. Define the problem", p: "Through dialogue, identify what isn't working, what the client has tried, and any error messages. Convert symptoms into a clear definition: \"The Chromebook is not turning on.\" Is this accessibility, hardware, or software?" },
+          { h: "2. Connect with a resource", p: "Use the problem definition to find a solution: official support pages, forums, AI chatbots. Show the client how you found it, even if you already know the answer." },
+          { h: "3. Guide through the solution", p: "Have the client implement the solution themselves with your guidance. Don't take the device. If you must, ask first: \"Can I take a look for a second?\"" },
+        ]} />
+      </Section>
+
+      <InfoBubble title="Why narrate your process out loud?">
+        <p style={{ margin: "0 0 10px" }}>
+          Concretely: at the end of the session, the client should be able to describe how they would solve a similar problem in the future without you. If they can't, you fixed the device but did not build autonomy.
+        </p>
+        <p style={{ margin: 0 }}>
+          Saying "I'm searching 'how to free up space on iPhone' on Google" out loud teaches a transferable skill. Silently typing the same query teaches nothing.
+        </p>
+      </InfoBubble>
+
+      <InfoBubble title="What if the client just wants you to fix it?">
+        <p style={{ margin: "0 0 10px" }}>
+          This will happen. A client who is frustrated, embarrassed, or pressed for time may not want a teaching moment. Acknowledge that and adapt: solve enough of the problem now to relieve the immediate pressure, and offer to walk through the process at the next visit.
+        </p>
+        <p style={{ margin: 0 }}>
+          Forcing autonomy on someone who is dysregulated will not build autonomy. It will build avoidance.
+        </p>
+      </InfoBubble>
+
+      <InfoBubble title="Common technical issues you'll encounter">
+        <ul style={{ margin: 0, paddingLeft: 18, lineHeight: 1.8 }}>
+          <li>Patient portals (especially MyChart): logins, two-factor authentication, finding lab results.</li>
+          <li>Accessibility settings: text size, screen readers, language settings, contrast.</li>
+          <li>Login info: helping clients record and recover usernames and passwords.</li>
+          <li>Telehealth: joining Zoom, microphone and camera permissions.</li>
+          <li>Storage: clearing space to install apps.</li>
+        </ul>
+        <p style={{ margin: "12px 0 0" }}>
+          Beyond the technical, expect emotional challenges: client frustration, embarrassment, and shame around not knowing how to do something. Manage expectations honestly when you can't resolve an issue, and have a referral path ready.
+        </p>
+      </InfoBubble>
+    </Card>
+  );
+}
+
+function ResourceGuideActivity() {
+  // Practice activity: build a resource guide for your community
+  const categories = [
+    { id: "broadband", label: "Low-cost broadband", example: "e.g., Lifeline, Comcast Internet Essentials" },
+    { id: "devices",   label: "Free or subsidized devices", example: "e.g., Computers4People, local refurbishers" },
+    { id: "cellular",  label: "Subsidized cellular plans", example: "e.g., SafeLink, Assurance Wireless" },
+    { id: "training",  label: "Local digital literacy classes", example: "e.g., public library, community center, Council on Aging" },
+    { id: "wifi",      label: "Public Wi-Fi access", example: "e.g., libraries, community centers, school hotspots" },
+  ];
+  const [entries, setEntries] = usePersistentActivity("troubleshooting:resource-guide:entries", {});
+  const [submitted, setSubmitted] = usePersistentActivity("troubleshooting:resource-guide:submitted", false);
+
+  const filledCount = Object.values(entries).filter(v => (v || "").trim().length > 0).length;
+
+  const onSubmit = () => {
+    setSubmitted(true);
+    markActivityDone("troubleshooting", "resource-guide");
+  };
+
+  return (
+    <ActivityWrap>
+      <ActivityHead
+        title="Build a community resource guide"
+        instructions="Resource guides are collections of community-specific resources that navigators compile for clients: low-cost broadband, free devices, subsidized cellular plans, local digital literacy classes. For each category below, identify at least one resource available in your community. If you don't know one, say what you'd search for."
+      />
+
+      {categories.map((c) => (
+        <div key={c.id} style={{ marginBottom: 14 }}>
+          <Eyebrow>{c.label}</Eyebrow>
+          <div style={{ fontSize: 11, color: TEXT_LIGHT, marginBottom: 6, fontStyle: "italic" }}>{c.example}</div>
+          <TextArea
+            value={entries[c.id]}
+            onChange={(v) => setEntries({ ...entries, [c.id]: v })}
+            disabled={submitted}
+            placeholder="Resource name, contact info, or what you'd look for..."
+            minHeight={50}
+          />
+        </div>
+      ))}
+
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 14 }}>
+        <div style={{ fontSize: 12, color: TEXT_LIGHT }}>
+          {filledCount} of {categories.length} categories filled
+        </div>
+        <SubmitBtn onClick={onSubmit} disabled={submitted} label="Save guide" submittedLabel="Saved" />
+      </div>
+
+      <SuggestedReveal show={submitted} title="Things to keep in mind">
+        <ul style={{ margin: 0, paddingLeft: 18, fontSize: 13, color: TEXT, lineHeight: 1.7 }}>
+          <li style={{ marginBottom: 6 }}>Resources change. Plan to update your guide every 6–12 months. Programs end, eligibility rules shift, contact info goes stale.</li>
+          <li style={{ marginBottom: 6 }}>Eligibility matters as much as the resource. A program a client doesn't qualify for is worse than no program, because it sets up a frustrating dead end.</li>
+          <li style={{ marginBottom: 0 }}>Print copies. Many clients you'll work with may not be able to read a digital resource guide on their phone, especially during the visit when they're already stuck.</li>
+        </ul>
+      </SuggestedReveal>
+    </ActivityWrap>
+  );
+}
+
+function TroubleshootingScenarioActivity() {
+  // Worksheet-style activity from preprint Figure 1
+  const scenarios = [
+    {
+      id: "s1",
+      blurb: "Maya, 58, comes in with her iPhone. Her doctor wants her using MyChart, but when she taps Install, she gets an error: \"Cannot install: not enough storage available.\" She's had the phone for several years and has never deleted any apps. She tells you: \"I knew I'd be terrible at this.\"",
+      isMaya: true,
+    },
+    {
+      id: "s2",
+      blurb: "A client in her late 60s enters your office with a Chromebook and has been attempting to access her patient portal. When you help her attempt to log in, she is unable to remember her password. Whenever she interacts with the device, the client has to squint and lean in to read the text.",
+    },
+    {
+      id: "s3",
+      blurb: "A client cannot join his telehealth appointment. He clicks the Zoom link in his email but a browser opens to a page that says \"Click here to join from your browser.\" He clicks it, but nothing happens.",
+    },
+  ];
+  const [active, setActive] = useState("s1");
+  const [responses, setResponses] = usePersistentActivity("troubleshooting:scenarios:responses", {});
+  const [submitted, setSubmitted] = usePersistentActivity("troubleshooting:scenarios:submitted", false);
+
+  const r = responses[active] || {};
+  const setR = (key, val) => setResponses({ ...responses, [active]: { ...(responses[active] || {}), [key]: val } });
+
+  const allDone = scenarios.every(s => {
+    const x = responses[s.id] || {};
+    return (x.questions || "").trim() && (x.problem || "").trim() && (x.resource || "").trim();
+  });
+
+  const onSubmit = () => {
+    setSubmitted(true);
+    markActivityDone("troubleshooting", "scenarios");
+  };
+
+  return (
+    <ActivityWrap>
+      <ActivityHead
+        title="Troubleshooting practice scenarios"
+        instructions="Three sample technical-support scenarios. For each, work through the three-step process: ask defining questions, identify the problem (accessibility, hardware, or software), and identify a resource you'd use to find a solution."
+      />
+
+      <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 14 }}>
+        {scenarios.map((s, i) => (
+          <button
+            key={s.id}
+            onClick={() => setActive(s.id)}
+            style={{
+              padding: "7px 14px", borderRadius: 8,
+              border: `1.5px solid ${active === s.id ? TEAL : WARM_DIM}`,
+              background: active === s.id ? TEAL_LIGHT : WHITE,
+              color: active === s.id ? TEAL_DARK : TEXT_LIGHT,
+              fontSize: 12, fontWeight: 600, cursor: "pointer",
+              fontFamily: "inherit",
+            }}
+          >
+            {s.isMaya ? "Scenario 1: Maya" : `Scenario ${i + 1}`}
+          </button>
+        ))}
+      </div>
+
+      <div style={{ padding: 14, background: WARM, borderRadius: 10, marginBottom: 14, fontSize: 13, color: TEXT, lineHeight: 1.6, fontStyle: "italic" }}>
+        {scenarios.find(s => s.id === active).blurb}
+      </div>
+
+      <div style={{ marginBottom: 14 }}>
+        <Eyebrow>What questions would you ask your client?</Eyebrow>
+        <TextArea value={r.questions} onChange={(v) => setR("questions", v)} disabled={submitted} placeholder="Open questions to define the problem..." minHeight={70} />
+      </div>
+      <div style={{ marginBottom: 14 }}>
+        <Eyebrow>What is the problem? Is it accessibility, hardware, or software?</Eyebrow>
+        <TextArea value={r.problem} onChange={(v) => setR("problem", v)} disabled={submitted} placeholder="Define the problem in one sentence and categorize it..." minHeight={60} />
+      </div>
+      <div style={{ marginBottom: 14 }}>
+        <Eyebrow>Where would you find the solution? What resource(s) would you use?</Eyebrow>
+        <TextArea value={r.resource} onChange={(v) => setR("resource", v)} disabled={submitted} placeholder="Specific search query, support page, or AI prompt..." minHeight={60} />
+      </div>
+
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 14 }}>
+        <div style={{ fontSize: 12, color: TEXT_LIGHT }}>
+          {scenarios.filter(s => {
+            const x = responses[s.id] || {};
+            return (x.questions || "").trim() && (x.problem || "").trim() && (x.resource || "").trim();
+          }).length} of {scenarios.length} scenarios complete
+        </div>
+        <SubmitBtn onClick={onSubmit} disabled={submitted || !allDone} label="Submit all" />
+      </div>
+
+      <SuggestedReveal show={submitted} title="Worked example: Maya's storage problem">
+        <div style={{ fontSize: 13, color: TEXT, lineHeight: 1.7 }}>
+          <div style={{ marginBottom: 10 }}>
+            <strong>Questions:</strong> "Can you show me the message you're seeing?" "When did you last delete anything from your phone, like photos or apps?" "Are there apps on your phone you haven't used in a while?" Note: don't open with "have you tried clearing space," which jumps to a solution before the problem is defined and reinforces Maya's "I'm terrible at this" framing.
+          </div>
+          <div style={{ marginBottom: 10 }}>
+            <strong>Problem:</strong> Software / storage. Her phone is full, probably from photos and apps she no longer uses. Not a hardware issue, not an accessibility issue. The MyChart install will succeed once there's about 200MB free.
+          </div>
+          <div style={{ marginBottom: 10 }}>
+            <strong>Resource:</strong> Apple's iPhone Storage page (Settings → General → iPhone Storage), which shows what's taking up space and offers recommendations. Demo the search out loud: "let's look up 'how to free up space on iPhone' together."
+          </div>
+          <div style={{ background: GOLD_LIGHT, padding: 12, borderRadius: 8, fontSize: 12, color: TEXT_MID, lineHeight: 1.6 }}>
+            <strong style={{ color: GOLD_DARK }}>The autonomy move:</strong> When Maya says "I knew I'd be terrible at this," resist the impulse to argue. Reflect ("It sounds like you came in expecting to fail at this") and then quietly demonstrate the search out loud, narrating each step. The point isn't to convince her she's good at technology. The point is to leave her with a method she could use again.
+          </div>
+        </div>
+      </SuggestedReveal>
+    </ActivityWrap>
+  );
+}
+
+// ============================================================================
+// MODULE 2 — DOORS & DIGITAL COMPETENCE
+// ============================================================================
+
+function CompetenceConcepts() {
+  return (
+    <Card>
+      <Section title="From troubleshooting to teaching">
+        <Prose>
+          Module 1 was about resolving immediate technical problems. This module is about what comes next: building a foundation of digital skills the client can actually use. That requires a different orientation, not just toward the problem in front of you, but toward the client's broader goals for their technology.
+        </Prose>
+        <Prose>
+          Two questions to start with: <em>What does "digital literacy" mean to you?</em> and <em>What challenges might you encounter teaching digital skills to adults?</em> Hold those. The rest of the module is one set of answers.
+        </Prose>
+      </Section>
+
+      <Section title="Two ways to teach">
+        <Prose>
+          Paulo Freire distinguished two models of education. In the <strong>banking concept</strong>, the teacher is an authority who deposits information into a passive student. In the <strong>problem-solving concept</strong>, teacher and student collaborate to find solutions to problems the student actually faces in their life. Freire argued the first model breeds passivity; the second builds agency.
+        </Prose>
+        <Prose>
+          For digital literacy work, this is the difference between "you need to learn these skills" and "what do you want to do with your device?" The second is harder. It's also the only one that produces durable autonomy.
+        </Prose>
+
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+          {[
+            {
+              alt: false, h: "Banking concept",
+              items: [
+                "Questions have an expected answer",
+                "Rote memorization is encouraged",
+                "Inflexible structure",
+                "Discussion is limited",
+                "\"You need to learn these skills.\"",
+              ],
+            },
+            {
+              alt: true, h: "Problem-solving concept",
+              items: [
+                "Questions are open-ended",
+                "Skill application is encouraged",
+                "Flexible structure",
+                "Discussion is essential",
+                "\"What do you want to do with your device?\"",
+              ],
+            },
+          ].map((col, i) => (
+            <div key={i} style={{ background: col.alt ? TEAL_LIGHT : WARM, borderRadius: 10, padding: 16 }}>
+              <div style={{
+                fontSize: 12, fontWeight: 700,
+                color: col.alt ? TEAL_DARK : NAVY,
+                textTransform: "uppercase", letterSpacing: ".04em",
+                marginBottom: 10,
+              }}>
+                {col.h}
+              </div>
+              <ul style={{ margin: 0, paddingLeft: 16, fontSize: 12, color: TEXT_MID, lineHeight: 1.6 }}>
+                {col.items.map((it, j) => <li key={j} style={{ marginBottom: 4 }}>{it}</li>)}
+              </ul>
+            </div>
+          ))}
+        </div>
+      </Section>
+
+      <Section title="The DOORS curriculum">
+        <Prose>
+          DOORS (Digital Outreach for Obtaining Resources & Skills) is the peer-reviewed digital literacy program your work builds on. It has nine modules covering fundamentals, accessibility, internet safety, messaging, video, organization, YouTube, well-being, and AI. Your job isn't to march clients through all nine. Your job is to match a client's stated goals to the right module(s).
+        </Prose>
+
+        <div style={{
+          background: WARM, borderRadius: 10, padding: 16, fontSize: 12, color: TEXT_MID,
+          lineHeight: 1.7, marginBottom: 12,
+        }}>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))", gap: 10 }}>
+            {[
+              "M1. Fundamentals",
+              "M2. Accessibility",
+              "M3. Internet & online safety",
+              "M4. Messaging",
+              "M5. Video",
+              "M6. Staying organized",
+              "M7. YouTube",
+              "M8. Well-being & fun",
+              "M9. AI safely",
+            ].map((m, i) => (
+              <div key={i} style={{ fontSize: 12, fontWeight: 600, color: NAVY }}>{m}</div>
+            ))}
+          </div>
+        </div>
+      </Section>
+
+      <Section title="Five teaching techniques">
+        <ConceptTiles tiles={[
+          { h: "Chunking",                p: "Break complex tasks into small steps. \"Just send an email\" → \"Let's start by opening the email app.\"" },
+          { h: "Modeling",                p: "Show, then have them try. Narrate as you do it: \"I tap Settings, then Wi-Fi, then I select the network.\"" },
+          { h: "Guided practice",         p: "Stay beside them. Offer prompts. \"That's right, tap the plus sign. Now type the date.\"" },
+          { h: "Check for understanding", p: "Don't assume. \"Can you show me one way to spot a scam message?\" Observation beats self-report." },
+          { h: "Error framing",           p: "Mistakes are normal, not failures. \"Passwords can be tricky. Let's try a reset link.\"" },
+        ]} />
+      </Section>
+    </Card>
+  );
+}
+
+function ModuleMatchActivity() {
+  const doorsModules = [
+    { id: "m1", label: "M1 — Fundamentals" },
+    { id: "m2", label: "M2 — Accessibility" },
+    { id: "m3", label: "M3 — Internet Safety" },
+    { id: "m4", label: "M4 — Messages" },
+    { id: "m5", label: "M5 — Video" },
+    { id: "m6", label: "M6 — Staying Organized" },
+    { id: "m7", label: "M7 — YouTube" },
+    { id: "m8", label: "M8 — Well-Being & Fun" },
+    { id: "m9", label: "M9 — AI Safely" },
+  ];
+
+  const cases = [
+    {
+      id: "c1",
+      text: "A client recently immigrated from the Dominican Republic. She would like to connect more with her family back home.",
+      correct: new Set(["m4", "m5"]),
+      explore: "Module 4 (Messages) covers texting and apps like WhatsApp; Module 5 (Video) covers video calling. Either alone is acceptable, both together is the strongest match.",
+    },
+    {
+      id: "c2",
+      text: "A client just received a smartphone for the first time and is completely unfamiliar with the device.",
+      correct: new Set(["m1"]),
+      explore: "Module 1 (Fundamentals) is the right starting point for a brand-new user. Jumping to a more specific module here would skip foundational concepts (the home screen, app icons, settings) that everything else depends on.",
+    },
+    {
+      id: "c3",
+      text: "A client somewhat familiar with the basics wants to learn how to 'do more' with her device for fun. She also wants to use it to learn about cooking.",
+      correct: new Set(["m7", "m8"]),
+      explore: "Module 7 (YouTube) directly covers learning skills via video, including cooking. Module 8 (Well-Being & Fun) covers using the phone for entertainment and personal interests.",
+    },
+    {
+      id: "c4",
+      text: "A client keeps missing appointments and wants to use their device to keep track of them. They also want to figure out their patient portal.",
+      correct: new Set(["m6", "m8"]),
+      explore: "Module 6 (Staying Organized) covers calendars and reminders. Module 8 includes patient portal content. Module 1 might also be relevant if the client struggles with basics; assess during the conversation.",
+    },
+  ];
+
+  const [selections, setSelections] = usePersistentActivity(
+    "competence:match:selections",
+    Object.fromEntries(cases.map(c => [c.id, new Set()]))
+  );
+  const [questions, setQuestions] = usePersistentActivity("competence:match:questions", {});
+  const [submitted, setSubmitted] = usePersistentActivity("competence:match:submitted", false);
+
+  const onSubmit = () => {
+    setSubmitted(true);
+    markActivityDone("competence", "match");
+  };
+
+  const toggle = (caseId, modId) => {
+    if (submitted) return;
+    setSelections((prev) => {
+      const next = { ...prev };
+      const s = new Set(next[caseId]);
+      if (s.has(modId)) s.delete(modId); else s.add(modId);
+      next[caseId] = s;
+      return next;
+    });
+  };
+
+  return (
+    <ActivityWrap>
+      <ActivityHead
+        title="Match clients to DOORS modules"
+        instructions="For each client, select one or more DOORS modules you'd recommend. Multiple modules can be a stronger match than one. Then write a brief note on what you'd ask first to confirm."
+      />
+
+      {cases.map((c, i) => {
+        const sel = selections[c.id];
+        const correctHits = [...sel].filter(s => c.correct.has(s));
+        const wrongHits = [...sel].filter(s => !c.correct.has(s));
+        const status = !submitted ? "neutral"
+          : (correctHits.length === c.correct.size && wrongHits.length === 0) ? "correct"
+          : (correctHits.length > 0 && wrongHits.length === 0) ? "partial"
+          : "incorrect";
+        const borderColor = status === "correct" ? TEAL : status === "partial" ? GOLD : status === "incorrect" ? CAUTION : WARM_DIM;
+
+        return (
+          <div
+            key={c.id}
+            style={{
+              marginBottom: 20, padding: 16, background: WARM,
+              borderRadius: 10, borderLeft: `3px solid ${borderColor}`,
+              transition: "border-color .2s",
+            }}
+          >
+            <Eyebrow>Client {i + 1}</Eyebrow>
+            <div style={{ fontSize: 13, color: TEXT, lineHeight: 1.6, marginBottom: 12 }}>
+              {c.text}
+            </div>
+            <div style={{ fontSize: 11, fontWeight: 600, color: TEXT_LIGHT, marginBottom: 6 }}>
+              DOORS modules to recommend
+            </div>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginBottom: 10 }}>
+              {doorsModules.map((m) => {
+                const isSel = sel.has(m.id);
+                const color = submitted
+                  ? (isSel && c.correct.has(m.id) ? "teal"
+                    : isSel && !c.correct.has(m.id) ? "caution"
+                    : !isSel && c.correct.has(m.id) ? "gold"
+                    : undefined)
+                  : "teal";
+                return (
+                  <TagButton
+                    key={m.id}
+                    label={m.label}
+                    selected={isSel || (submitted && c.correct.has(m.id))}
+                    onClick={() => toggle(c.id, m.id)}
+                    color={color}
+                    disabled={submitted}
+                  />
+                );
+              })}
+            </div>
+            <div style={{ fontSize: 11, fontWeight: 600, color: TEXT_LIGHT, marginBottom: 4 }}>
+              First question you'd ask this client
+            </div>
+            <TextArea
+              value={questions[c.id]}
+              onChange={(v) => !submitted && setQuestions({ ...questions, [c.id]: v })}
+              disabled={submitted}
+              placeholder="What would you want to know before recommending a module?"
+              minHeight={50}
+            />
+          </div>
+        );
+      })}
+
+      <div style={{ display: "flex", justifyContent: "flex-end" }}>
+        <SubmitBtn onClick={onSubmit} disabled={submitted} />
+      </div>
+
+      <SuggestedReveal show={submitted}>
+        {cases.map((c, i) => (
+          <div key={c.id} style={{ marginBottom: 14, paddingBottom: 14, borderBottom: i < cases.length - 1 ? `1px solid rgba(42,157,143,.2)` : "none" }}>
+            <div style={{ fontSize: 12, fontWeight: 700, color: TEAL_DARK, marginBottom: 4 }}>Client {i + 1}</div>
+            <div style={{ fontSize: 13, color: TEXT_MID, lineHeight: 1.6 }}>{c.explore}</div>
+          </div>
+        ))}
+      </SuggestedReveal>
+    </ActivityWrap>
+  );
+}
+
+function ChunkingActivity() {
+  const taskOptions = [
+    "Connect to Wi-Fi",
+    "Download an app from the App Store or Google Play",
+    "Take and send a photo by text",
+    "Set a reminder on your phone",
+    "Adjust the phone's screen brightness",
+    "Join a video call using a link from email or text",
+    "Open and read a message in a patient portal",
+    "Update or reset a forgotten password",
+    "Turn on \"Do Not Disturb\" mode",
+    "Find and open the health tracking app (e.g., for sleep or mood)",
+  ];
+
+  const [task, setTask] = usePersistentActivity("competence:chunk:task", "");
+  const [steps, setSteps] = usePersistentActivity("competence:chunk:steps", ["", "", ""]);
+  const [submitted, setSubmitted] = usePersistentActivity("competence:chunk:submitted", false);
+
+  const onSubmit = () => {
+    setSubmitted(true);
+    markActivityDone("competence", "chunk");
+  };
+
+  const addStep = () => setSteps([...steps, ""]);
+  const removeStep = (i) => setSteps(steps.filter((_, idx) => idx !== i));
+  const updateStep = (i, v) => setSteps(steps.map((s, idx) => idx === i ? v : s));
+
+  const filledSteps = steps.filter(s => s.trim().length > 0).length;
+
+  return (
+    <ActivityWrap>
+      <ActivityHead
+        title="Chunking practice"
+        instructions="Pick a common digital task and break it into small, manageable steps. Use plain language (no tech jargon). Keep each step focused and manageable. Think about logical order: what would a first-time learner encounter?"
+      />
+
+      <Eyebrow>Choose a task</Eyebrow>
+      <select
+        value={task}
+        onChange={(e) => setTask(e.target.value)}
+        disabled={submitted}
+        style={{
+          width: "100%", maxWidth: 460, padding: "10px 12px",
+          borderRadius: 8, border: `1.5px solid ${WARM_DIM}`,
+          fontSize: 13, fontFamily: "inherit",
+          background: WHITE, color: task ? TEXT : TEXT_LIGHT,
+          marginBottom: 18,
+        }}
+      >
+        <option value="" disabled>Pick a task to chunk...</option>
+        {taskOptions.map((t) => <option key={t} value={t}>{t}</option>)}
+      </select>
+
+      <Eyebrow>Your chunked steps</Eyebrow>
+      <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 12 }}>
+        {steps.map((s, i) => (
+          <div key={i} style={{ display: "flex", alignItems: "flex-start", gap: 10 }}>
+            <div style={{
+              width: 26, height: 26, borderRadius: "50%",
+              background: NAVY, color: WHITE,
+              fontSize: 12, fontWeight: 700,
+              display: "flex", alignItems: "center", justifyContent: "center",
+              flexShrink: 0, marginTop: 4,
+            }}>
+              {i + 1}
+            </div>
+            <div style={{ flex: 1 }}>
+              <TextArea
+                value={s}
+                onChange={(v) => updateStep(i, v)}
+                disabled={submitted}
+                placeholder={i === 0 ? "First step (the smallest possible action)..." : "Next step..."}
+                minHeight={40}
+              />
+            </div>
+            {!submitted && steps.length > 1 && (
+              <button
+                onClick={() => removeStep(i)}
+                style={{
+                  width: 26, height: 26, borderRadius: 6,
+                  border: "none", background: WARM, color: TEXT_LIGHT,
+                  cursor: "pointer", flexShrink: 0, marginTop: 4,
+                  display: "flex", alignItems: "center", justifyContent: "center",
+                  fontFamily: "inherit",
+                }}
+              >
+                ×
+              </button>
+            )}
+          </div>
+        ))}
+      </div>
+
+      {!submitted && (
+        <button
+          onClick={addStep}
+          style={{
+            padding: "8px 14px", borderRadius: 8, border: `1.5px dashed ${WARM_DIM}`,
+            background: WHITE, color: TEXT_LIGHT,
+            fontSize: 12, fontWeight: 600, cursor: "pointer",
+            fontFamily: "inherit",
+          }}
+        >
+          + Add a step
+        </button>
+      )}
+
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 18 }}>
+        <div style={{ fontSize: 12, color: TEXT_LIGHT }}>
+          {filledSteps} step{filledSteps !== 1 ? "s" : ""} written
+        </div>
+        <SubmitBtn onClick={onSubmit} disabled={submitted || !task || filledSteps < 2} />
+      </div>
+
+      <SuggestedReveal show={submitted} title="What good chunking looks like">
+        <div style={{ fontSize: 13, color: TEXT, lineHeight: 1.7 }}>
+          <div style={{ marginBottom: 10 }}>
+            <strong>Worked example: "Send an email"</strong>
+          </div>
+          <ol style={{ margin: 0, paddingLeft: 20 }}>
+            <li>Open the email app (it looks like an envelope).</li>
+            <li>Tap the pencil or "Compose" button (usually in the bottom corner).</li>
+            <li>In the "To" field, type the email address of the person you're writing to.</li>
+            <li>In the "Subject" field, write what the email is about in a few words.</li>
+            <li>Tap below the subject and type your message.</li>
+            <li>When you're ready, tap "Send" (usually a paper airplane icon).</li>
+          </ol>
+          <div style={{ marginTop: 12, marginBottom: 12 }}>
+            Six steps, each one tap or one short typing action. If your steps were longer than that, say "go to the email app and compose a new message," that's two sub-steps collapsed into one. For a first-time learner, that's too big.
+          </div>
+          <div style={{
+            background: GOLD_LIGHT, padding: 12, borderRadius: 8,
+            fontSize: 12, color: TEXT_MID, lineHeight: 1.6,
+          }}>
+            <strong style={{ color: GOLD_DARK }}>The competence move:</strong> Chunking is what makes competence possible. A step that's too big lets the client fail and confirms what they already feared about themselves. A step that's the right size lets them succeed and notice that they succeeded. Six small wins in a row do something a single big task can't: they accumulate into the felt experience of <em>I did that.</em> Your job, when you walk Maya through opening the portal, is to size the steps so that experience can happen.
+          </div>
+        </div>
+      </SuggestedReveal>
+    </ActivityWrap>
+  );
+}
+
+function ExplainConceptsActivity() {
+  // Worksheet: explain a concept without jargon
+  const concepts = [
+    "What is a patient portal, and why would Maya want to use one?",
+    "What is Wi-Fi, and how is it different from cellular data?",
+    "What is a scam message, and how can you spot one?",
+    "What is an app, and how is it different from a website?",
+  ];
+  const [picked, setPicked] = usePersistentActivity("competence:explain:picked", concepts[0]);
+  const [explanation, setExplanation] = usePersistentActivity("competence:explain:text", "");
+  const [submitted, setSubmitted] = usePersistentActivity("competence:explain:submitted", false);
+
+  const onSubmit = () => {
+    setSubmitted(true);
+    markActivityDone("competence", "explain");
+  };
+
+  return (
+    <ActivityWrap>
+      <ActivityHead
+        title="Explain a simple concept without jargon"
+        instructions="Pick one of the concepts below. Write an explanation as if you're talking to a 75-year-old client who has just bought their first smartphone. Use analogies they'd recognize from non-digital life. Don't use technical terms without defining them."
+      />
+
+      <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 14 }}>
+        {concepts.map((c) => (
+          <button
+            key={c}
+            onClick={() => !submitted && setPicked(c)}
+            disabled={submitted}
+            style={{
+              padding: "8px 14px", borderRadius: 8,
+              border: `1.5px solid ${picked === c ? TEAL : WARM_DIM}`,
+              background: picked === c ? TEAL_LIGHT : WHITE,
+              color: picked === c ? TEAL_DARK : TEXT_LIGHT,
+              fontSize: 12, fontWeight: 600, cursor: submitted ? "default" : "pointer",
+              fontFamily: "inherit", textAlign: "left",
+            }}
+          >
+            {c}
+          </button>
+        ))}
+      </div>
+
+      <Eyebrow>Your explanation</Eyebrow>
+      <TextArea
+        value={explanation}
+        onChange={setExplanation}
+        disabled={submitted}
+        placeholder="Try to keep it under 120 words. Use one analogy. Define every technical term you use."
+        minHeight={140}
+      />
+
+      <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 14 }}>
+        <SubmitBtn onClick={onSubmit} disabled={submitted || !explanation.trim()} />
+      </div>
+
+      <SuggestedReveal show={submitted} title="A few things that usually help">
+        <ul style={{ margin: 0, paddingLeft: 18, fontSize: 13, color: TEXT, lineHeight: 1.7 }}>
+          <li style={{ marginBottom: 6 }}><strong>Lead with an analogy from the physical world.</strong> Email is like postal mail (you have an address, you write to someone, they get it later). Wi-Fi is like the radio signal that comes into your house: only your house has it, and you can use it for free once you're inside.</li>
+          <li style={{ marginBottom: 6 }}><strong>Define every technical term.</strong> If you use the word "browser," follow it with "the app you use to look at websites, like Google Chrome or Safari."</li>
+          <li style={{ marginBottom: 0 }}><strong>Read it back to yourself out loud.</strong> If a sentence sounds like it would only make sense to someone who already knows the answer, rewrite it.</li>
+        </ul>
+      </SuggestedReveal>
+    </ActivityWrap>
+  );
+}
+
+// ============================================================================
+// MODULE 3 — HEALTHCARE & DIGITAL RELATEDNESS
+// ============================================================================
+
+function RelatednessConcepts() {
+  return (
+    <Card>
+      <Section title="What changes when the work is healthcare">
+        <Prose>
+          The first two modules covered the universal parts of the navigator role: troubleshooting and digital literacy. This module covers what's specifically <em>healthcare</em> about Digital Health Navigation. Some of that is structural: clinical terminology, HIPAA, safe-handling guidelines, and the technologies you'll encounter (telehealth, remote monitoring, patient portals). But the bigger shift is in what the client is doing in the room with you. In Module 1, Maya wanted to install MyChart. In Module 3, she's being asked to take on a tool to help her live with diabetes. Those are different kinds of asks. The first is a task. The second is a relationship.
+        </Prose>
+      </Section>
+
+      <Section title="Why this module is about relatedness">
+        <Prose>
+          A client adopting a digital health tool is not just learning to use software. They're agreeing to let a piece of technology be present for something difficult: a chronic illness, a mental health concern, a behavior they're trying to change. The question they're really answering when you hand them an app isn't "can I figure out the buttons." It's "do I want this thing in my life, in this way, alongside this condition?"
+        </Prose>
+        <Prose>
+          That's where relatedness lives. The navigator's job in this module is to hear what the client is telling you about how they want to be related to: by their tool, by their care team, and by you. The MindApps framework below gives you a vocabulary for the technical surface. The skill this module teaches is hearing what's underneath it.
+        </Prose>
+
+        <div style={{
+          background: TEAL_LIGHT, border: `1px solid ${TEAL}`,
+          borderRadius: 10, padding: 16, marginBottom: 18,
+        }}>
+          <div style={{ fontSize: 11, fontWeight: 700, color: TEAL_DARK, textTransform: "uppercase", letterSpacing: ".06em", marginBottom: 8 }}>
+            The two layers of a client's request
+          </div>
+          <div style={{ fontSize: 13, color: TEXT, lineHeight: 1.7 }}>
+            When a client describes what they want from a digital health tool, they're almost always telling you two things at once. The <strong>technical layer</strong> is the feature request: "I want something to track my mood." The <strong>relational layer</strong> is how they want the tool to be present for them: "I don't want anything that's going to nag me." A navigator who only hears the first layer matches features. A navigator who hears both makes a recommendation the client will actually use.
+          </div>
+        </div>
+      </Section>
+
+      <Section title="The MindApps framework">
+        <Prose>
+          mindapps.org is a database of 500+ evaluated mental health apps maintained by the Division of Digital Psychiatry. Every app is rated against five dimensions, drawn from the American Psychiatric Association's app evaluation framework. These are the technical-layer filters you'll work with when matching a client to a tool.
+        </Prose>
+        <ConceptTiles tiles={[
+          { h: "Accessibility",         p: "Is the app accessible for the user? Cost, language, device support, accommodations." },
+          { h: "Privacy & Security",     p: "Does the app uphold user safety, security, and privacy by protecting data? What's the privacy policy?" },
+          { h: "Clinical Foundation",    p: "Is the app supported by research? Evidence base, peer-reviewed studies." },
+          { h: "Engagement Style",       p: "Is the app usable and customizable? Does it fit how the user wants to interact?" },
+          { h: "Data Sharing",           p: "How easily can the app share data in a clinically meaningful way? Can the client export to share with their clinician?" },
+        ]} />
+        <Prose>
+          The dimensions look like a checklist, but they're better understood as places where relational content surfaces. A client who says "I don't trust those companies with my information" is doing more than ticking the privacy box; they're telling you something about trust, control, and prior experience with being failed by institutions. Notice both.
+        </Prose>
+      </Section>
+
+      <div style={{
+        background: CAUTION_LIGHT, border: `1.5px solid ${CAUTION}`,
+        borderRadius: 10, padding: 16, marginBottom: 18,
+      }}>
+        <div style={{ fontSize: 11, fontWeight: 700, color: CAUTION, textTransform: "uppercase", letterSpacing: ".06em", marginBottom: 8 }}>
+          Clinical red flags: escalate, don't navigate
+        </div>
+        <div style={{ fontSize: 13, color: TEXT, lineHeight: 1.7, marginBottom: 10 }}>
+          Most navigators are not licensed healthcare professionals, and even those who are need to know when a moment has stopped being a navigation moment. Stop the technology conversation and follow your site's escalation path if a client expresses or shows any of the following:
+        </div>
+        <ul style={{ margin: 0, paddingLeft: 18, fontSize: 13, color: TEXT, lineHeight: 1.7 }}>
+          <li style={{ marginBottom: 4 }}>Suicidality, self-harm, or a plan to harm themselves</li>
+          <li style={{ marginBottom: 4 }}>Threats to harm others</li>
+          <li style={{ marginBottom: 4 }}>Signs of acute psychosis, severe disorientation, or a mental state in which they cannot meaningfully consent to using a tool</li>
+          <li style={{ marginBottom: 0 }}>Disclosure of abuse, neglect, or being unsafe at home</li>
+        </ul>
+        <div style={{ fontSize: 13, color: TEXT, lineHeight: 1.7, marginTop: 10 }}>
+          Know your site's escalation path before your first session. If you don't have one, that's the first thing to ask your supervisor for.
+        </div>
+      </div>
+
+      <InfoBubble title="Practical guardrails: what you can and can't discuss">
+        <p style={{ margin: "0 0 10px" }}>
+          Beyond the red flags above, day-to-day clinical questions also belong with the clinician. When a client raises a concern about symptoms, diagnosis, medications, or treatment decisions, redirect: "That's a great question for your clinician. Let's make sure you can use this tool to bring it up at your next visit." The redirect is itself a relatedness move; you're showing the client you know your role and showing them the structure of care they're inside of.
+        </p>
+        <p style={{ margin: 0 }}>
+          You're also bound by HIPAA when handling client health information. Keep notes secure, share only what's necessary for care or operations, and report any privacy breach to your supervisor immediately.
+        </p>
+      </InfoBubble>
+
+      <InfoBubble title="What relatedness looks like in the room">
+        <p style={{ margin: "0 0 10px" }}>
+          A client who walks away with a digital health tool but no plan to use it has not been served. A client who walks away with a tool, a clear use plan, and a follow-up date has. Relatedness is built less through the recommendation than through the structure around it: the conversation that surfaces the goal, the plan that names how the tool fits, and the follow-up that says you'll check in.
+        </p>
+        <p style={{ margin: 0 }}>
+          Concretely, this module's three activities each address one part of that arc. The Key Phrase activity is about hearing the relational content underneath an app-feature request. The Health Goals Survey is about feeling the form from the client's side before you walk one through it. The Use Plan is where the relationship gets a date on it.
+        </p>
+      </InfoBubble>
+    </Card>
+  );
+}
+
+function KeyPhraseActivity() {
+  // From preprint Module 3: pull key phrases out of a vignette and map to features
+  const features = [
+    { id: "privacy_low",    label: "Privacy not a primary concern" },
+    { id: "privacy_high",   label: "Privacy a primary concern" },
+    { id: "symptom_track",  label: "Symptom tracking" },
+    { id: "exercise_track", label: "Exercise tracking" },
+    { id: "passive",        label: "Passive data / wearable" },
+    { id: "low_engage",     label: "Low engagement required" },
+    { id: "high_engage",    label: "High engagement OK" },
+    { id: "spanish",        label: "Available in Spanish" },
+    { id: "free",           label: "Free to use" },
+    { id: "sleep",          label: "Sleep tracking" },
+    { id: "anxiety",        label: "Anxiety / mindfulness" },
+    { id: "mood",           label: "Mood tracking" },
+    { id: "adhd",           label: "ADHD / executive function" },
+    { id: "journal",        label: "Journaling" },
+    { id: "diabetes",       label: "Diabetes / glucose tracking" },
+    { id: "simple_ui",      label: "Simple, unintimidating UI" },
+  ];
+
+  const cases = [
+    {
+      id: "maya",
+      label: "Case 1: Maya",
+      vignette: "Maya, 58, has been managing Type 2 diabetes for three years. Her PCP has suggested an app to help track her blood glucose readings and meals. Maya tells you she's open to trying it, but \"I don't want anything that's going to nag me all day or make me feel worse about how I'm doing.\" She's been frustrated with the patient portal and says she wants something simple. She doesn't want to share data with anyone other than her doctor and is worried about \"what those companies do with the information.\"",
+      correct: new Set(["diabetes", "symptom_track", "low_engage", "privacy_high", "simple_ui"]),
+      keyPhrases: [
+        ["track her blood glucose readings and meals", "diabetes / symptom_track"],
+        ["don't want anything that's going to nag me all day", "low_engage"],
+        ["wants something simple", "simple_ui"],
+        ["worried about 'what those companies do with the information'", "privacy_high"],
+      ],
+      relationalContent: "Maya is telling you she's already had this conversation with herself, and she's lost some of it. \"Make me feel worse about how I'm doing\" is an admission that she expects technology to be one more source of failure. \"Those companies\" is a small but real signal that she's been failed by institutions before. The app match has to honor both of these: not just low-engagement and high-privacy on paper, but a tool whose tone won't activate the shame she's already braced for. A perfect feature match in a guilt-trippy app interface will not get used.",
+    },
+    {
+      id: "case1",
+      label: "Case 2",
+      vignette: "Client is a 37-year-old, male identified, fully employed. Client stated he was open to trying apps and was not as concerned with app privacy. Client also reported that he feels his mood is often strongly associated with his exercise levels. Client mentioned they are looking for a mobile technology that does not require high engagement, as it can be difficult to remember to use technology regularly.",
+      correct: new Set(["privacy_low", "exercise_track", "mood", "passive", "low_engage"]),
+      keyPhrases: [
+        ["not as concerned with app privacy", "privacy_low"],
+        ["mood is often strongly associated with his exercise levels", "exercise_track + mood"],
+        ["does not require high engagement", "passive / low engagement"],
+      ],
+      relationalContent: "This client is making a self-characterization: someone who forgets to use technology, who has already noticed a pattern in his own mood without being prompted, who is comfortable with apps but doesn't want one demanding things of him. The relational signal is that he wants a tool that fits around an existing self-knowledge, not one that's going to teach him about himself. A passive wearable plus an unobtrusive app he can check when curious will land. A daily-prompt mood-tracking app that pings him to reflect will not.",
+    },
+    {
+      id: "case2",
+      label: "Case 3",
+      vignette: "Client is a 29-year-old, female identified, fully employed, voluntarily seeking services with the encouragement of her supportive husband. Client reported difficulties staying asleep, decrease in appetite, and constantly worried about her family's well-being. Client reported she enjoyed using smartphone technology in her personal life but never used apps for healthcare. Client stated she was open to trying apps but stated her privacy was 'a high priority.' Client also reported she enjoyed outdoor activities, journaling, and watching movies.",
+      correct: new Set(["privacy_high", "sleep", "anxiety", "symptom_track", "journal"]),
+      keyPhrases: [
+        ["privacy was 'a high priority'", "privacy_high"],
+        ["difficulties staying asleep", "sleep tracking"],
+        ["constantly worried about her family", "anxiety"],
+        ["decrease in appetite", "symptom tracking"],
+        ["enjoyed... journaling", "journal"],
+      ],
+      relationalContent: "This client makes a careful distinction: she's comfortable with her phone for personal use, but she's never used it for healthcare. That gap is the relational signal. Bringing health into a space she previously kept casual is a real shift, and her stated privacy concern is partly about that boundary. The match has to acknowledge the threshold she's crossing. Recommending a journaling-style anxiety app fits both the technical features and the fact that journaling is something she already does for herself. A sleep tracker that demands data sharing with a clinical platform she doesn't trust will not.",
+    },
+  ];
+
+  const [activeCase, setActiveCase] = useState("maya");
+  const [selections, setSelections] = usePersistentActivity(
+    "relatedness:keyphrase:selections",
+    { maya: new Set(), case1: new Set(), case2: new Set() }
+  );
+  const [appNotes, setAppNotes] = usePersistentActivity("relatedness:keyphrase:appNotes", {});
+  const [relationalNotes, setRelationalNotes] = usePersistentActivity("relatedness:keyphrase:relationalNotes", {});
+  const [submitted, setSubmitted] = usePersistentActivity("relatedness:keyphrase:submitted", false);
+
+  const c = cases.find(x => x.id === activeCase);
+  const sel = selections[activeCase] || new Set();
+
+  const toggle = (fid) => {
+    if (submitted) return;
+    setSelections((prev) => {
+      const next = { ...prev };
+      const s = new Set(next[activeCase] || []);
+      if (s.has(fid)) s.delete(fid); else s.add(fid);
+      next[activeCase] = s;
+      return next;
+    });
+  };
+
+  const onSubmit = () => {
+    setSubmitted(true);
+    markActivityDone("relatedness", "keyphrase");
+  };
+
+  return (
+    <ActivityWrap>
+      <ActivityHead
+        title="Hearing both layers: features and relational content"
+        instructions="Each case below contains two layers. The technical layer is the feature request: what the client wants the app to do. The relational layer is what they're telling you about how they want the tool to be in their life. For each case, do two things: tag the relevant app features (technical layer), then write a few sentences on the relational content (what the client is telling you about how they want to be related to). The technical layer narrows the search; the relational layer is what makes the recommendation actually fit."
+      />
+
+      <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 14 }}>
+        {cases.map((cc, i) => (
+          <button
+            key={cc.id}
+            onClick={() => setActiveCase(cc.id)}
+            style={{
+              padding: "7px 14px", borderRadius: 8,
+              border: `1.5px solid ${activeCase === cc.id ? TEAL : WARM_DIM}`,
+              background: activeCase === cc.id ? TEAL_LIGHT : WHITE,
+              color: activeCase === cc.id ? TEAL_DARK : TEXT_LIGHT,
+              fontSize: 12, fontWeight: 600, cursor: "pointer",
+              fontFamily: "inherit",
+            }}
+          >
+            {cc.label}
+          </button>
+        ))}
+      </div>
+
+      <div style={{
+        padding: 16, background: WARM, borderRadius: 10, marginBottom: 16,
+        fontSize: 13, color: TEXT, lineHeight: 1.7, fontStyle: "italic",
+      }}>
+        {c.vignette}
+      </div>
+
+      <Eyebrow>Technical layer: relevant app features (select all that apply)</Eyebrow>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginBottom: 16 }}>
+        {features.map((f) => {
+          const isSel = sel.has(f.id);
+          const color = submitted
+            ? (isSel && c.correct.has(f.id) ? "teal"
+              : isSel && !c.correct.has(f.id) ? "caution"
+              : !isSel && c.correct.has(f.id) ? "gold"
+              : undefined)
+            : "teal";
+          return (
+            <TagButton
+              key={f.id}
+              label={f.label}
+              selected={isSel || (submitted && c.correct.has(f.id))}
+              onClick={() => toggle(f.id)}
+              color={color}
+              disabled={submitted}
+            />
+          );
+        })}
+      </div>
+
+      <Eyebrow>What would you search for on mindapps.org for this client?</Eyebrow>
+      <TextArea
+        value={appNotes[activeCase]}
+        onChange={(v) => !submitted && setAppNotes({ ...appNotes, [activeCase]: v })}
+        disabled={submitted}
+        placeholder="e.g., 'free anxiety app available in Spanish with sleep tracking'..."
+        minHeight={50}
+      />
+
+      <div style={{ marginTop: 18 }}>
+        <Eyebrow>Relational layer: what is this client telling you about how they want to be related to?</Eyebrow>
+        <div style={{ fontSize: 11, color: TEXT_LIGHT, fontStyle: "italic", marginBottom: 6 }}>
+          What's the client's prior experience with technology, with their condition, with being helped? What tone or style of tool would land well, and what would backfire?
+        </div>
+        <TextArea
+          value={relationalNotes[activeCase]}
+          onChange={(v) => !submitted && setRelationalNotes({ ...relationalNotes, [activeCase]: v })}
+          disabled={submitted}
+          placeholder="A few sentences on what's underneath the feature request..."
+          minHeight={80}
+        />
+      </div>
+
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 18 }}>
+        <div style={{ fontSize: 12, color: TEXT_LIGHT }}>
+          {submitted ? "Submitted" : "Tab between cases as you go"}
+        </div>
+        <SubmitBtn onClick={onSubmit} disabled={submitted} />
+      </div>
+
+      <SuggestedReveal show={submitted} title="Both layers, side by side">
+        {cases.map((cc, i) => (
+          <div key={cc.id} style={{ marginBottom: 18, paddingBottom: 16, borderBottom: i < cases.length - 1 ? `1px solid rgba(42,157,143,.2)` : "none" }}>
+            <div style={{ fontSize: 12, fontWeight: 700, color: TEAL_DARK, marginBottom: 8 }}>{cc.label}</div>
+            <div style={{ fontSize: 11, fontWeight: 700, color: TEXT_LIGHT, textTransform: "uppercase", letterSpacing: ".06em", marginBottom: 6 }}>
+              Technical layer (key phrases → features)
+            </div>
+            {cc.keyPhrases.map(([phrase, mapping], j) => (
+              <div key={j} style={{ fontSize: 13, color: TEXT, lineHeight: 1.6, marginBottom: 4 }}>
+                <em>"{phrase}"</em> &nbsp;→&nbsp; <strong>{mapping}</strong>
+              </div>
+            ))}
+            <div style={{ fontSize: 11, fontWeight: 700, color: TEXT_LIGHT, textTransform: "uppercase", letterSpacing: ".06em", marginTop: 12, marginBottom: 6 }}>
+              Relational layer (what's underneath)
+            </div>
+            <div style={{ fontSize: 13, color: TEXT, lineHeight: 1.7 }}>
+              {cc.relationalContent}
+            </div>
+          </div>
+        ))}
+        <div style={{ padding: 14, background: GOLD_LIGHT, borderRadius: 8, marginTop: 4 }}>
+          <div style={{ fontSize: 12, color: TEXT_MID, lineHeight: 1.6 }}>
+            <strong style={{ color: GOLD_DARK }}>The relatedness move:</strong> Two navigators looking at the same vignette can produce the same feature tags and still make different recommendations. The trainee who only hears the technical layer will hand Maya a low-engagement diabetes app and consider the job done. The trainee who hears the relational layer will spend an extra minute scanning for an app whose tone won't activate her shame. The clients you'll work with will rarely tell you the relational content directly. They'll embed it: in what they're worried about, in what they don't want, in the example of a previous tool that didn't work for them. The skill is hearing it without making them say it twice.
+          </div>
+        </div>
+      </SuggestedReveal>
+    </ActivityWrap>
+  );
+}
+
+function HealthGoalsSurveyActivity() {
+  // Fillable form: practice with a hypothetical client
+  const focusAreas = [
+    "Managing my focus or attention",
+    "Improving my mood or mental health",
+    "Reducing stress or anxiety",
+    "Sleeping better",
+    "Reducing or quitting smoking or tobacco",
+    "Drinking less alcohol",
+    "Reducing or quitting drug use",
+    "Managing pain",
+    "Feeling more in control of my emotions",
+    "Getting support with trauma or PTSD",
+    "Eating in a healthier way",
+    "Managing a chronic condition",
+    "Getting help with OCD or unwanted thoughts",
+    "Supporting recovery from self-harm",
+    "Just feeling better overall",
+  ];
+  const toolKinds = [
+    "Apps to track mood, sleep, or stress",
+    "Tools to help me stick to health habits",
+    "Information or videos to learn about a condition",
+    "Chat or text support",
+    "Breathing or meditation apps",
+    "Online therapy or support groups",
+    "Tools to help with focus or attention",
+    "I'm not sure yet, I'd like to learn more",
+  ];
+
+  const [data, setData] = usePersistentActivity("relatedness:health-goals:data", {
+    name: "", date: "",
+    focus: new Set(),
+    using: "",
+    usingWhat: "",
+    interested: "",
+    kinds: new Set(),
+    other: "",
+  });
+  const [saved, setSaved] = usePersistentActivity("relatedness:health-goals:saved", false);
+
+  const onSave = () => {
+    setSaved(true);
+    markActivityDone("relatedness", "health-goals");
+  };
+
+  const toggleSet = (key, val) => {
+    setData((prev) => {
+      const next = { ...prev };
+      const s = new Set(next[key]);
+      if (s.has(val)) s.delete(val); else s.add(val);
+      next[key] = s;
+      return next;
+    });
+  };
+
+  return (
+    <ActivityWrap>
+      <ActivityHead
+        title="Health Goals Survey (fillable practice form)"
+        instructions="This is the actual Health Goals Survey used in navigator sessions. Practice filling it out as if you were a client. The point is to feel the form from the client's side before you walk one through it."
+      />
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 18 }}>
+        <div>
+          <Eyebrow>Name (or pseudonym for practice)</Eyebrow>
+          <TextInput value={data.name} onChange={(v) => setData({ ...data, name: v })} disabled={saved} placeholder="Practice client" />
+        </div>
+        <div>
+          <Eyebrow>Date</Eyebrow>
+          <TextInput value={data.date} onChange={(v) => setData({ ...data, date: v })} disabled={saved} placeholder="MM/DD/YYYY" />
+        </div>
+      </div>
+
+      <div style={{ marginBottom: 18 }}>
+        <Eyebrow>1. What are some health areas you'd like to focus on? (Check all that apply)</Eyebrow>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+          {focusAreas.map((a) => (
+            <TagButton
+              key={a}
+              label={a}
+              selected={data.focus.has(a)}
+              onClick={() => !saved && toggleSet("focus", a)}
+              disabled={saved}
+              color="teal"
+            />
+          ))}
+        </div>
+      </div>
+
+      <div style={{ marginBottom: 18 }}>
+        <Eyebrow>2. Do you currently use any apps or online tools to help with your health?</Eyebrow>
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 8 }}>
+          {["Yes", "No", "I'm not sure"].map((opt) => (
+            <button
+              key={opt}
+              onClick={() => !saved && setData({ ...data, using: opt })}
+              disabled={saved}
+              style={{
+                padding: "7px 14px", borderRadius: 8,
+                border: `1.5px solid ${data.using === opt ? TEAL : WARM_DIM}`,
+                background: data.using === opt ? TEAL_LIGHT : WHITE,
+                color: data.using === opt ? TEAL_DARK : TEXT_LIGHT,
+                fontSize: 12, fontWeight: 600, cursor: saved ? "default" : "pointer",
+                fontFamily: "inherit",
+              }}
+            >
+              {opt}
+            </button>
+          ))}
+        </div>
+        {data.using === "Yes" && (
+          <TextInput
+            value={data.usingWhat}
+            onChange={(v) => setData({ ...data, usingWhat: v })}
+            disabled={saved}
+            placeholder="If yes, what do you use?"
+          />
+        )}
+      </div>
+
+      <div style={{ marginBottom: 18 }}>
+        <Eyebrow>3. Are you interested in using digital tools to help with your health goals?</Eyebrow>
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+          {["Yes", "Maybe / Not sure yet", "No"].map((opt) => (
+            <button
+              key={opt}
+              onClick={() => !saved && setData({ ...data, interested: opt })}
+              disabled={saved}
+              style={{
+                padding: "7px 14px", borderRadius: 8,
+                border: `1.5px solid ${data.interested === opt ? TEAL : WARM_DIM}`,
+                background: data.interested === opt ? TEAL_LIGHT : WHITE,
+                color: data.interested === opt ? TEAL_DARK : TEXT_LIGHT,
+                fontSize: 12, fontWeight: 600, cursor: saved ? "default" : "pointer",
+                fontFamily: "inherit",
+              }}
+            >
+              {opt}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div style={{ marginBottom: 18 }}>
+        <Eyebrow>4. What kinds of tools might interest you? (Check all that apply)</Eyebrow>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+          {toolKinds.map((k) => (
+            <TagButton
+              key={k}
+              label={k}
+              selected={data.kinds.has(k)}
+              onClick={() => !saved && toggleSet("kinds", k)}
+              disabled={saved}
+              color="teal"
+            />
+          ))}
+        </div>
+      </div>
+
+      <div style={{ marginBottom: 18 }}>
+        <Eyebrow>5. Anything else you want to share about your health goals or what support would be helpful?</Eyebrow>
+        <TextArea value={data.other} onChange={(v) => setData({ ...data, other: v })} disabled={saved} placeholder="Open response..." minHeight={70} />
+      </div>
+
+      <div style={{ display: "flex", justifyContent: "flex-end" }}>
+        <SubmitBtn onClick={onSave} disabled={saved} label="Save form" submittedLabel="Saved" />
+      </div>
+    </ActivityWrap>
+  );
+}
+
+function UsePlanActivity() {
+  // Fillable Use Plan form
+  const [d, setD] = usePersistentActivity("relatedness:use-plan:data", {
+    tool: "", goal: "", frequency: "", checkin: "",
+    features: "", barriers: "", problemPlan: "", successSign: "",
+  });
+  const [saved, setSaved] = usePersistentActivity("relatedness:use-plan:saved", false);
+
+  const onSave = () => {
+    setSaved(true);
+    markActivityDone("relatedness", "use-plan");
+  };
+
+  const fields = [
+    { key: "tool",       label: "1. Digital health tool", placeholder: "Name of the app or tool" },
+    { key: "goal",       label: "2. What is the health goal you want to work on?", placeholder: "Specific, named goal..." },
+    { key: "frequency",  label: "3. How often do you intend to use this tool?", placeholder: "Daily? Weekly? At a specific time?" },
+    { key: "checkin",    label: "4. When and how will your Digital Navigator check in with you?", placeholder: "Date, mode (in-person, phone, text)" },
+    { key: "features",   label: "5. What features of the tool will you use most?", placeholder: "Specific features named..." },
+    { key: "barriers",   label: "6. What could get in the way of using this tool?", placeholder: "Anticipate the obstacle..." },
+    { key: "problemPlan",label: "7. What will you do if you run into a problem?", placeholder: "Concrete fallback plan..." },
+    { key: "successSign",label: "8. How will you know it's helping?", placeholder: "What changes in your life would tell you it's working?" },
+  ];
+
+  return (
+    <ActivityWrap>
+      <ActivityHead
+        title="Digital Health Tool Use Plan (fillable practice form)"
+        instructions="The Use Plan is what a navigator fills out with a client after picking a digital health tool. Practice it solo: imagine a client (or use the same hypothetical from the Health Goals Survey above) and walk through the questions. The plan is what makes the tool actually get used."
+      />
+
+      {fields.map((f) => (
+        <div key={f.key} style={{ marginBottom: 14 }}>
+          <Eyebrow>{f.label}</Eyebrow>
+          <TextArea
+            value={d[f.key]}
+            onChange={(v) => !saved && setD({ ...d, [f.key]: v })}
+            disabled={saved}
+            placeholder={f.placeholder}
+            minHeight={50}
+          />
+        </div>
+      ))}
+
+      <div style={{ display: "flex", justifyContent: "flex-end" }}>
+        <SubmitBtn onClick={onSave} disabled={saved} label="Save plan" submittedLabel="Saved" />
+      </div>
+
+      <SuggestedReveal show={saved} title="What makes a Use Plan actually work">
+        <ul style={{ margin: 0, paddingLeft: 18, fontSize: 13, color: TEXT, lineHeight: 1.7, marginBottom: 14 }}>
+          <li style={{ marginBottom: 6 }}><strong>The barriers and problem plan are the most important questions.</strong> A client without a plan for "what if it stops working" will quietly drop the tool the first time it does.</li>
+          <li style={{ marginBottom: 6 }}><strong>Frequency should be specific.</strong> "Daily" is weaker than "right after I take my morning meds." The trigger matters more than the rate.</li>
+          <li style={{ marginBottom: 0 }}><strong>The check-in is the commitment.</strong> Setting a real date, not "we'll check in sometime," is what makes the plan feel real to both of you.</li>
+        </ul>
+        <div style={{
+          background: GOLD_LIGHT, padding: 12, borderRadius: 8,
+          fontSize: 12, color: TEXT_MID, lineHeight: 1.6,
+        }}>
+          <strong style={{ color: GOLD_DARK }}>The relatedness move:</strong> The Use Plan looks like a document, but its real function is relational. Maya is being asked to add a digital health tool to a life that already feels like too much. The thing that turns "another app" into "the thing my navigator and I are working on together" is question 4: the check-in. A real date, in a real calendar, with you. That's what tells her she isn't being handed a tool and left alone with it. Without that line, the plan is paperwork. With it, the plan is a relationship.
+        </div>
+      </SuggestedReveal>
+    </ActivityWrap>
+  );
+}
+
+// ============================================================================
+// MODULE 4 — MOTIVATIONAL INTERVIEWING
+// ============================================================================
+
+function MIConcepts() {
+  return (
+    <Card>
+      <Section title="What Motivational Interviewing is for">
+        <Prose>
+          A client coming into a Digital Navigation session is often carrying something. Shame about not knowing how to do something they think they "should" know. Frustration with a device that has been failing them. Anxiety about the appointment, the navigator, or the technology itself. Motivational Interviewing (MI) is a structured conversational style for working with that, not around it.
+        </Prose>
+        <Prose>
+          Developed by William Miller and Stephen Rollnick, MI was originally designed for substance use treatment but has been applied across healthcare settings where the goal is behavior change. It positions the navigator as a <strong>guide</strong>, situated between directing ("here's what you should do") and following ("I trust you'll figure it out"): actively involved, but in service of what the client wants.
+        </Prose>
+      </Section>
+
+      <Section title="Four principles">
+        <ConceptTiles tiles={[
+          { h: "Collaboration", p: "MI is done with the client, not to them. People are experts in themselves; the navigator is a partner in the process." },
+          { h: "Acceptance",    p: "Accept what the client brings (their feelings, their resistance, their pace) without trying to immediately change it." },
+          { h: "Compassion",    p: "Actively prioritize the client's well-being. Their needs come first, not your timeline or workflow." },
+          { h: "Evocation",     p: "The motivation to change is already in the client. Your job is to help them find and articulate it." },
+        ]} />
+      </Section>
+
+      <Section title="Four phases of an MI conversation">
+        <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 14 }}>
+          {[
+            { n: "1", h: "Engaging", p: "Build a trusting, collaborative relationship. Demonstrate empathy for the client's particular comfort with technology. Make a space where lack of knowledge is safely discussed." },
+            { n: "2", h: "Focusing", p: "Clarify direction. What does the client want to do with technology? What goals are they bringing in? Use the Technology Use Survey or Health Goals Survey to anchor the conversation." },
+            { n: "3", h: "Evoking",  p: "Surface the client's own reasons for engaging. Explore ambivalence. Highlight strengths and prior successes. The motivation comes from them, not from you." },
+            { n: "4", h: "Planning", p: "Co-author concrete next steps. Set goals, identify barriers, develop strategies. The Use Plan from Module 3 lives here." },
+          ].map((p) => (
+            <div key={p.n} style={{ display: "flex", gap: 12, padding: 14, background: WARM, borderRadius: 10 }}>
+              <div style={{
+                width: 28, height: 28, borderRadius: "50%",
+                background: TEAL, color: WHITE,
+                fontSize: 13, fontWeight: 700,
+                display: "flex", alignItems: "center", justifyContent: "center",
+                flexShrink: 0,
+              }}>
+                {p.n}
+              </div>
+              <div>
+                <div style={{ fontSize: 13, fontWeight: 700, color: NAVY, marginBottom: 4 }}>{p.h}</div>
+                <div style={{ fontSize: 12, color: TEXT_MID, lineHeight: 1.5 }}>{p.p}</div>
+              </div>
+            </div>
+          ))}
+        </div>
+      </Section>
+
+      <Section title="OARS: the four core skills">
+        <Prose>
+          The rest of this module is built around OARS: Open-ended questions, Affirmations, Reflective listening, and Summaries. Each gets its own practice activity. Work through them in order; reflective listening especially needs the foundation of the first two.
+        </Prose>
+      </Section>
+    </Card>
+  );
+}
+
+function OpenQuestionsActivity() {
+  const items = [
+    { id: "q1", original: "Have you tried restarting your phone?",  problem: "Closed / yes-no" },
+    { id: "q2", original: "You know how to use the portal, right?", problem: "Leading + closed" },
+    { id: "q3", original: "Do you want to learn about the app or do you just want help messaging your doctor?", problem: "Double-barreled" },
+    { id: "q4", original: "Don't you think this app will be helpful?", problem: "Leading" },
+    { id: "q5", original: "Are you stressed about this?", problem: "Closed / leading" },
+  ];
+  const [r, setR] = usePersistentActivity("mi:open:r", {});
+  const [submitted, setSubmitted] = usePersistentActivity("mi:open:submitted", false);
+
+  const setKey = (id, key, val) => setR({ ...r, [id]: { ...(r[id] || {}), [key]: val } });
+
+  const onSubmit = () => {
+    setSubmitted(true);
+    markActivityDone("mi", "open");
+  };
+
+  return (
+    <ActivityWrap>
+      <ActivityHead
+        title="OARS practice 1: open-ended questions"
+        instructions="For each question below, name what's wrong with it (closed, leading, double-barreled, etc.), then rewrite it as an open-ended question that invites the client to elaborate. Open questions usually start with How, What, or Why."
+      />
+
+      {items.map((q, i) => (
+        <div key={q.id} style={{ marginBottom: 18, padding: 14, background: WARM, borderRadius: 10 }}>
+          <Eyebrow>Original question {i + 1}</Eyebrow>
+          <div style={{ fontSize: 14, color: CAUTION, fontStyle: "italic", marginBottom: 12 }}>"{q.original}"</div>
+
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 2fr", gap: 12 }}>
+            <div>
+              <Eyebrow>What's wrong?</Eyebrow>
+              <TextArea
+                value={r[q.id]?.problem}
+                onChange={(v) => setKey(q.id, "problem", v)}
+                disabled={submitted}
+                placeholder="e.g., closed / leading"
+                minHeight={50}
+              />
+            </div>
+            <div>
+              <Eyebrow>Your open-ended version</Eyebrow>
+              <TextArea
+                value={r[q.id]?.rewrite}
+                onChange={(v) => setKey(q.id, "rewrite", v)}
+                disabled={submitted}
+                placeholder="Start with How, What, or Why..."
+                minHeight={50}
+              />
+            </div>
+          </div>
+        </div>
+      ))}
+
+      <div style={{ display: "flex", justifyContent: "flex-end" }}>
+        <SubmitBtn onClick={onSubmit} disabled={submitted} />
+      </div>
+
+      <SuggestedReveal show={submitted} title="One way to rewrite each">
+        {items.map((q, i) => (
+          <div key={q.id} style={{ marginBottom: 12, paddingBottom: 10, borderBottom: i < items.length - 1 ? `1px solid rgba(42,157,143,.2)` : "none" }}>
+            <div style={{ fontSize: 12, color: TEXT_LIGHT, marginBottom: 4 }}>
+              <em>"{q.original}"</em> ({q.problem})
+            </div>
+            <div style={{ fontSize: 13, color: TEAL_DARK, fontWeight: 600 }}>
+              {q.id === "q1" && "→ \"What have you tried so far to fix the problem?\""}
+              {q.id === "q2" && "→ \"What's been your experience with the portal so far?\""}
+              {q.id === "q3" && "→ \"What would be most useful to start with today?\""}
+              {q.id === "q4" && "→ \"What are you hoping the app could do for you?\""}
+              {q.id === "q5" && "→ \"What's been on your mind about this?\""}
+            </div>
+          </div>
+        ))}
+      </SuggestedReveal>
+    </ActivityWrap>
+  );
+}
+
+function AffirmationsActivity() {
+  const items = [
+    {
+      id: "a1",
+      client: "I finally figured out how to log in on my own.",
+      response: "Good job, that's awesome!",
+      kind: "praise",
+      failureMode: "Generic. Could be said about anything by anyone. Doesn't tell the client you actually heard what they did.",
+      better: "It sounds like you really stuck with it and figured it out on your own. That shows determination.",
+    },
+    {
+      id: "a2",
+      client: "I was really nervous, but I came back for the second training anyway.",
+      response: "You're so brave!",
+      kind: "praise",
+      failureMode: "Trait attribution. Calling someone brave is a judgment about who they are; an affirmation describes what they did and lets them draw the conclusion.",
+      better: "Coming back when something made you nervous took real courage.",
+    },
+    {
+      id: "a3",
+      client: "I asked my daughter to show me how to download the app.",
+      response: "That's a great idea. You're clearly determined to figure this out.",
+      kind: "affirmation",
+      failureMode: null,
+      better: "Already a strong affirmation: specific to what the client did, grounded in observable behavior, and lands without sounding evaluative.",
+    },
+    {
+      id: "a4",
+      client: "I've been struggling with this for weeks, but I finally got the video calling to work.",
+      response: "You're doing better than most of my clients your age!",
+      kind: "praise",
+      failureMode: "Comparison. Tying the client's progress to other people's, especially other people in their demographic, undermines the affirmation. The client did this; the comparison makes it about you and your other clients.",
+      better: "Weeks of work, and you got there. That kind of persistence is what makes this stick.",
+    },
+    {
+      id: "a5",
+      client: "I almost cancelled today because I was overwhelmed, but I came in anyway because I said I would.",
+      response: "Following through on a commitment when it would have been easier not to is something you clearly take seriously.",
+      kind: "affirmation",
+      failureMode: null,
+      better: "Solid values-based affirmation. Names the specific behavior (following through despite being overwhelmed) and reflects the value the client themselves voiced (\"because I said I would\") without praising or evaluating.",
+    },
+    {
+      id: "a6",
+      client: "I figured out how to attach a photo to a message on the second try.",
+      response: "Wow, you're a fast learner!",
+      kind: "praise",
+      failureMode: "Looks like an observation, but it's actually a trait label and a generalization. \"Fast learner\" is a category the client now has to either accept or quietly disagree with. An affirmation stays with what they did, not what kind of person they are.",
+      better: "Getting that on the second try means you noticed something the first time that you used the second time. That's how this builds.",
+    },
+  ];
+  const [r, setR] = usePersistentActivity("mi:affirm:r", {});
+  const [submitted, setSubmitted] = usePersistentActivity("mi:affirm:submitted", false);
+
+  const setKey = (id, key, val) => setR({ ...r, [id]: { ...(r[id] || {}), [key]: val } });
+
+  const onSubmit = () => {
+    setSubmitted(true);
+    markActivityDone("mi", "affirm");
+  };
+
+  return (
+    <ActivityWrap>
+      <ActivityHead
+        title="OARS practice 2: affirmations vs. praise"
+        instructions="Affirmations are specific, genuine, and grounded in what the client actually did. Praise is generic, evaluative, or about the client as a person rather than what they did. Some of the responses below are affirmations; some are praise; one or two are sneakier than they look. For each row, decide which it is. If it's praise, name what kind of failure it is, then rewrite it as a true affirmation."
+      />
+
+      {items.map((it, i) => (
+        <div key={it.id} style={{ marginBottom: 18, padding: 14, background: WARM, borderRadius: 10 }}>
+          <Eyebrow>Pair {i + 1}</Eyebrow>
+          <div style={{ fontSize: 13, color: TEXT, lineHeight: 1.6, marginBottom: 4 }}>
+            <strong>Client:</strong> <em>"{it.client}"</em>
+          </div>
+          <div style={{ fontSize: 13, color: TEXT, lineHeight: 1.6, marginBottom: 12 }}>
+            <strong>Navigator response:</strong> <em>"{it.response}"</em>
+          </div>
+
+          <div style={{ display: "flex", gap: 6, marginBottom: 12, flexWrap: "wrap" }}>
+            {[{ v: "affirmation", label: "Affirmation" }, { v: "praise", label: "Praise" }].map((opt) => (
+              <button
+                key={opt.v}
+                onClick={() => setKey(it.id, "label", opt.v)}
+                disabled={submitted}
+                style={{
+                  padding: "7px 14px", borderRadius: 8,
+                  border: `1.5px solid ${r[it.id]?.label === opt.v ? TEAL : WARM_DIM}`,
+                  background: r[it.id]?.label === opt.v ? TEAL_LIGHT : WHITE,
+                  color: r[it.id]?.label === opt.v ? TEAL_DARK : TEXT_LIGHT,
+                  fontSize: 12, fontWeight: 600, cursor: submitted ? "default" : "pointer",
+                  fontFamily: "inherit",
+                }}
+              >
+                {opt.label}
+              </button>
+            ))}
+            {submitted && (
+              <span style={{
+                padding: "7px 12px", borderRadius: 8,
+                background: r[it.id]?.label === it.kind ? TEAL_LIGHT : CAUTION_LIGHT,
+                color: r[it.id]?.label === it.kind ? TEAL_DARK : CAUTION,
+                fontSize: 12, fontWeight: 600,
+              }}>
+                {r[it.id]?.label === it.kind ? "Correct" : `Actually: ${it.kind}`}
+              </span>
+            )}
+          </div>
+
+          <Eyebrow>Your improved affirmation (or note on why this one already works)</Eyebrow>
+          <TextArea
+            value={r[it.id]?.rewrite}
+            onChange={(v) => setKey(it.id, "rewrite", v)}
+            disabled={submitted}
+            placeholder="Specific, genuine, grounded in what the client did..."
+            minHeight={50}
+          />
+          {submitted && (
+            <>
+              {it.failureMode && (
+                <div style={{ marginTop: 10, padding: 10, background: CAUTION_LIGHT, borderRadius: 8, fontSize: 12, color: CAUTION, lineHeight: 1.5 }}>
+                  <strong>What went wrong:</strong> {it.failureMode}
+                </div>
+              )}
+              <div style={{ marginTop: 10, padding: 10, background: TEAL_LIGHT, borderRadius: 8, fontSize: 12, color: TEAL_DARK, lineHeight: 1.5 }}>
+                <strong>One option:</strong> {it.better}
+              </div>
+            </>
+          )}
+        </div>
+      ))}
+
+      <div style={{ display: "flex", justifyContent: "flex-end" }}>
+        <SubmitBtn onClick={onSubmit} disabled={submitted} />
+      </div>
+
+      <SuggestedReveal show={submitted} title="Four ways praise sneaks in">
+        <ul style={{ margin: 0, paddingLeft: 18, fontSize: 13, color: TEXT, lineHeight: 1.7 }}>
+          <li style={{ marginBottom: 6 }}><strong>Generic.</strong> "Good job!" "Nice work!" Could be said by anyone about anything. Tells the client nothing about what you actually noticed.</li>
+          <li style={{ marginBottom: 6 }}><strong>Trait attribution.</strong> "You're so brave." "You're so determined." Names a quality the client now has to accept or quietly disagree with. Affirmations describe behavior; trainees learn the move by always asking <em>what did they do</em> rather than <em>what are they.</em></li>
+          <li style={{ marginBottom: 6 }}><strong>Comparison.</strong> "You're doing better than most of my clients." Makes the client's effort about your other clients. Even when it's flattering, it pulls focus away from them.</li>
+          <li style={{ marginBottom: 0 }}><strong>Disguised evaluation.</strong> "Wow, you're a fast learner!" Looks observational but is actually a category label. Stays away from what the client specifically did this time.</li>
+        </ul>
+        <div style={{ marginTop: 14, padding: 12, background: GOLD_LIGHT, borderRadius: 8, fontSize: 12, color: TEXT_MID, lineHeight: 1.6 }}>
+          <strong style={{ color: GOLD_DARK }}>The competence move:</strong> Affirmations and praise both feel positive in the moment, but they do different things to a client's sense of competence. Praise creates a small dependency: the client got the thumbs up <em>this time</em>, and now needs another one next time. An affirmation describes what they did in a way that's portable. They can carry it out of the session and remember it the next time something is hard. The work is to notice what's actually happening, name it back specifically, and let the client draw the conclusion themselves.</div>
+      </SuggestedReveal>
+    </ActivityWrap>
+  );
+}
+
+function ReflectiveListeningActivity() {
+  const items = [
+    {
+      id: "r1",
+      statement: "I've tried logging into the app three times this week, but it never works. I'm honestly just about ready to give up.",
+      sampleParaphrase: "You've been trying all week to log in, and it just hasn't worked.",
+      sampleFeeling: "It sounds like you're really frustrated and discouraged.",
+    },
+    {
+      id: "r2",
+      statement: "I've never used an app like this. I feel totally lost.",
+      sampleParaphrase: "This is your first time with an app like this, and right now nothing about it feels familiar.",
+      sampleFeeling: "Sounds like you're feeling overwhelmed, like you don't know where to start.",
+    },
+    {
+      id: "r3",
+      statement: "My internet is always cutting out. It's so frustrating.",
+      sampleParaphrase: "Your internet keeps going down, and it's been an ongoing problem.",
+      sampleFeeling: "That kind of unreliable connection sounds exhausting and irritating.",
+    },
+  ];
+  const [r, setR] = usePersistentActivity("mi:reflect:r", {});
+  const [submitted, setSubmitted] = usePersistentActivity("mi:reflect:submitted", false);
+  const setKey = (id, key, val) => setR({ ...r, [id]: { ...(r[id] || {}), [key]: val } });
+
+  const onSubmit = () => {
+    setSubmitted(true);
+    markActivityDone("mi", "reflect");
+  };
+
+  return (
+    <ActivityWrap>
+      <ActivityHead
+        title="OARS practice 3: reflective listening"
+        instructions="For each client statement, write two reflections: a paraphrase that restates the content in your own words, and a feeling reflection that names the emotion. Don't add advice. Don't ask a question. Just reflect."
+      />
+
+      {items.map((it, i) => (
+        <div key={it.id} style={{ marginBottom: 18, padding: 14, background: WARM, borderRadius: 10 }}>
+          <Eyebrow>Client statement {i + 1}</Eyebrow>
+          <div style={{ fontSize: 14, color: TEXT, fontStyle: "italic", marginBottom: 14, lineHeight: 1.6 }}>
+            "{it.statement}"
+          </div>
+
+          <Eyebrow>Paraphrase the content</Eyebrow>
+          <TextArea
+            value={r[it.id]?.paraphrase}
+            onChange={(v) => setKey(it.id, "paraphrase", v)}
+            disabled={submitted}
+            placeholder="Restate what they said in your own words..."
+            minHeight={50}
+          />
+          {submitted && (
+            <div style={{ margin: "8px 0 14px", padding: 10, background: TEAL_LIGHT, borderRadius: 8, fontSize: 12, color: TEAL_DARK, lineHeight: 1.5 }}>
+              <strong>Sample:</strong> {it.sampleParaphrase}
+            </div>
+          )}
+
+          <Eyebrow>Reflect the feeling</Eyebrow>
+          <TextArea
+            value={r[it.id]?.feeling}
+            onChange={(v) => setKey(it.id, "feeling", v)}
+            disabled={submitted}
+            placeholder="Name the emotion you're hearing..."
+            minHeight={50}
+          />
+          {submitted && (
+            <div style={{ marginTop: 8, padding: 10, background: TEAL_LIGHT, borderRadius: 8, fontSize: 12, color: TEAL_DARK, lineHeight: 1.5 }}>
+              <strong>Sample:</strong> {it.sampleFeeling}
+            </div>
+          )}
+        </div>
+      ))}
+
+      <div style={{ display: "flex", justifyContent: "flex-end" }}>
+        <SubmitBtn onClick={onSubmit} disabled={submitted} />
+      </div>
+
+      <SuggestedReveal show={submitted} title="What separates good reflection from bad">
+        <ul style={{ margin: 0, paddingLeft: 18, fontSize: 13, color: TEXT, lineHeight: 1.7 }}>
+          <li style={{ marginBottom: 6 }}><strong>Don't parrot.</strong> Repeating the client's exact words can feel patronizing. Use your own phrasing while keeping the meaning.</li>
+          <li style={{ marginBottom: 6 }}><strong>Statement, not question.</strong> "It sounds like you're frustrated" lands differently than "Are you frustrated?" The first invites them to confirm or correct; the second feels like an interrogation.</li>
+          <li style={{ marginBottom: 0 }}><strong>It's okay to be wrong.</strong> If your reflection misses, the client will correct you, and that correction is information you didn't have before.</li>
+        </ul>
+      </SuggestedReveal>
+    </ActivityWrap>
+  );
+}
+
+function SummariesActivity() {
+  const monologues = [
+    {
+      id: "s1",
+      text: "I've been coming to these sessions because I know I need to get better with technology, but honestly, I feel like every time I learn something new, I forget it by the next day. It's frustrating, and it's embarrassing too. Like, who forgets how to check their messages after doing it ten times? I don't want to waste your time. But I also really need to be able to check my doctor's notes on my own.",
+    },
+    {
+      id: "s2",
+      text: "My son keeps telling me this app will help with my anxiety, but I don't know. It's just one more thing on my plate. I already feel overwhelmed half the time trying to keep up with regular appointments, work, and remembering passwords. I mean, I like that someone's checking in on me through it. That part actually feels nice. But I don't know if I can keep up with it all.",
+    },
+  ];
+  const [active, setActive] = useState("s1");
+  const [r, setR] = usePersistentActivity("mi:summarize:r", {});
+  const [submitted, setSubmitted] = usePersistentActivity("mi:summarize:submitted", false);
+
+  const setKey = (id, key, val) => setR({ ...r, [id]: { ...(r[id] || {}), [key]: val } });
+  const m = monologues.find(x => x.id === active);
+
+  const onSubmit = () => {
+    setSubmitted(true);
+    markActivityDone("mi", "summarize");
+  };
+
+  return (
+    <ActivityWrap>
+      <ActivityHead
+        title="OARS practice 4: summaries"
+        instructions="A summary closes a section or session. It should: (a) start with a transition phrase, (b) organize key points and emotions, (c) reflect any ambivalence, and (d) end with an invitation for the client to clarify or correct."
+      />
+
+      <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 14 }}>
+        {monologues.map((mm, i) => (
+          <button
+            key={mm.id}
+            onClick={() => setActive(mm.id)}
+            style={{
+              padding: "7px 14px", borderRadius: 8,
+              border: `1.5px solid ${active === mm.id ? TEAL : WARM_DIM}`,
+              background: active === mm.id ? TEAL_LIGHT : WHITE,
+              color: active === mm.id ? TEAL_DARK : TEXT_LIGHT,
+              fontSize: 12, fontWeight: 600, cursor: "pointer",
+              fontFamily: "inherit",
+            }}
+          >
+            Monologue {i + 1}
+          </button>
+        ))}
+      </div>
+
+      <div style={{ padding: 16, background: WARM, borderRadius: 10, marginBottom: 16, fontSize: 13, color: TEXT, lineHeight: 1.7, fontStyle: "italic" }}>
+        "{m.text}"
+      </div>
+
+      <Eyebrow>Your summary</Eyebrow>
+      <TextArea
+        value={r[active]?.summary}
+        onChange={(v) => setKey(active, "summary", v)}
+        disabled={submitted}
+        placeholder="Start with a transition phrase. Hit the key points. Name the ambivalence. End with an invitation to clarify."
+        minHeight={140}
+      />
+
+      <div style={{ marginTop: 14, padding: 14, background: GOLD_LIGHT, borderRadius: 8, fontSize: 12, color: TEXT_MID, lineHeight: 1.6 }}>
+        <div style={{ fontSize: 11, fontWeight: 700, color: GOLD_DARK, marginBottom: 6, letterSpacing: ".04em" }}>Self-check</div>
+        Did you start with a phrase like "Let me see if I've got this..."? Did you name <em>both</em> the difficulty and what's working? Did you end with something like "Did I get that right?" or "What did I miss?"
+      </div>
+
+      <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 14 }}>
+        <SubmitBtn onClick={onSubmit} disabled={submitted} />
+      </div>
+
+      <SuggestedReveal show={submitted} title={`Sample summary for monologue ${active === "s1" ? "1" : "2"}`}>
+        <div style={{ fontSize: 13, color: TEXT, lineHeight: 1.7, fontStyle: "italic" }}>
+          {active === "s1"
+            ? "\"Let me see if I've got this. You've been showing up to these sessions because being able to check your doctor's notes on your own really matters to you. At the same time, it's been frustrating that things aren't sticking, and that frustration has shaded into feeling embarrassed, like you should already know this. There's also some worry about taking up my time. Did I get that right, or is there something I'm missing?\""
+            : "\"So if I'm hearing you right: your son's recommended this app, and there's a part of it that genuinely feels supportive. The check-ins with someone are landing in a good way. And at the same time, you're already running close to the edge with everything else you're keeping track of, and adding one more thing feels heavy, even if the thing itself is helpful. Does that capture where you are? What did I miss?\""
+          }
+        </div>
+        <div style={{ marginTop: 10, fontSize: 12, color: TEXT_LIGHT, lineHeight: 1.6 }}>
+          Notice the structure: transition phrase → what's working in their words → ambivalence named → invitation to correct. The summary doesn't fix anything. It just shows the client they've been heard. Try the other monologue to compare.
+        </div>
+      </SuggestedReveal>
+    </ActivityWrap>
+  );
+}
+
+function SynthesisActivity() {
+  // The integrative move from the preprint: revisit an earlier scenario and
+  // redo it with MI techniques. Trainee picks one of the prior moments.
+  const moments = [
+    {
+      id: "maya-storage",
+      anchor: "Module 1 — Maya's storage problem",
+      scene: "Maya, 58, comes in unable to install MyChart because her phone is full. She tells you, half-laughing: \"I knew I'd be terrible at this. My daughter keeps telling me I should just let her do it.\"",
+      sample: "Open question: \"What would it mean to you to be able to do this without your daughter?\" This opens the value, not the task. Reflection of feeling: \"It sounds like there's some frustration with feeling like this is something you should already know.\" Affirmation: \"You came in here even though it would have been easier to ask your daughter. That took something.\"",
+    },
+    {
+      id: "maya-portal",
+      anchor: "Module 2 — Teaching Maya the portal",
+      scene: "You've been showing Maya how to read messages in MyChart. She keeps tapping the wrong icon, gets visibly tense, and says: \"This is what I mean. I just can't do this. My brain doesn't work like this.\"",
+      sample: "Reflection of feeling: \"You're feeling like the device is winning right now.\" Open question: \"What's gone well in the last few minutes that I might not have noticed?\" Affirmation grounded in observed behavior: \"You picked up the swipe-back gesture on the second try. That's a real piece of progress.\" Then a reset: pull back to a smaller chunk.",
+    },
+    {
+      id: "maya-app",
+      anchor: "Module 3 — Recommending the diabetes app",
+      scene: "You're partway through introducing the diabetes self-management app. Maya says: \"Look, I appreciate this, but I've got too much going on. The portal is already a lot. I don't think I can take on something else right now.\"",
+      sample: "Reflection: \"It feels like another thing on a stack that's already pretty full.\" Then evoke without pushing: \"What would have to be different for this to feel worth it for you?\" Resist the urge to defend the app. Acceptance: \"now\" might mean \"not yet,\" or it might mean \"not ever,\" and either is the client's to decide.",
+    },
+    {
+      id: "earlier-scenario",
+      anchor: "An earlier troubleshooting scenario from your own work",
+      scene: "Pick a real or hypothetical session you've had with a client where things didn't quite land. What did the client say? What did you say back? What was happening underneath?",
+      sample: "There's no canonical answer here. The value is in writing out the moment in detail before trying to redo it. Be specific. \"I felt rushed\" is less useful than \"I jumped to the fix because I was aware of the next appointment.\"",
+    },
+  ];
+
+  const [activeMoment, setActiveMoment] = usePersistentActivity("mi:synthesis:moment", "maya-storage");
+  const [responses, setResponses] = usePersistentActivity("mi:synthesis:responses", {});
+  const [submitted, setSubmitted] = usePersistentActivity("mi:synthesis:submitted", false);
+
+  const r = responses[activeMoment] || {};
+  const setR = (key, val) => {
+    setResponses({ ...responses, [activeMoment]: { ...(responses[activeMoment] || {}), [key]: val } });
+  };
+
+  const onSubmit = () => {
+    setSubmitted(true);
+    markActivityDone("mi", "synthesis");
+  };
+
+  const m = moments.find(x => x.id === activeMoment);
+
+  return (
+    <ActivityWrap>
+      <ActivityHead
+        title="Synthesis: redo an earlier moment with MI"
+        instructions="Pick a moment from earlier in the training (or one of your own) where the conversation went sideways. Write what you would say differently now, using OARS. The point isn't a perfect script. It's noticing where MI techniques would have changed the texture of the conversation."
+      />
+
+      <Eyebrow>Pick a moment</Eyebrow>
+      <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 14 }}>
+        {moments.map((mm) => (
+          <button
+            key={mm.id}
+            onClick={() => setActiveMoment(mm.id)}
+            disabled={submitted}
+            style={{
+              padding: "8px 14px", borderRadius: 8,
+              border: `1.5px solid ${activeMoment === mm.id ? TEAL : WARM_DIM}`,
+              background: activeMoment === mm.id ? TEAL_LIGHT : WHITE,
+              color: activeMoment === mm.id ? TEAL_DARK : TEXT_LIGHT,
+              fontSize: 12, fontWeight: 600,
+              cursor: submitted ? "default" : "pointer",
+              fontFamily: "inherit", textAlign: "left",
+            }}
+          >
+            {mm.anchor}
+          </button>
+        ))}
+      </div>
+
+      <div style={{ padding: 16, background: WARM, borderRadius: 10, marginBottom: 18, fontSize: 13, color: TEXT, lineHeight: 1.7, fontStyle: "italic" }}>
+        {m.scene}
+      </div>
+
+      <div style={{ marginBottom: 14 }}>
+        <Eyebrow>What's the OARS skill that would most change this moment?</Eyebrow>
+        <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+          {[
+            { id: "open",     label: "Open-ended question" },
+            { id: "affirm",   label: "Affirmation" },
+            { id: "reflect",  label: "Reflective listening" },
+            { id: "summary",  label: "Summary" },
+            { id: "multi",    label: "More than one" },
+          ].map((opt) => (
+            <TagButton
+              key={opt.id}
+              label={opt.label}
+              selected={r.skill === opt.id}
+              onClick={() => setR("skill", opt.id)}
+              disabled={submitted}
+              color="teal"
+            />
+          ))}
+        </div>
+      </div>
+
+      <div style={{ marginBottom: 14 }}>
+        <Eyebrow>What would you say or ask, using that skill?</Eyebrow>
+        <TextArea
+          value={r.rewrite}
+          onChange={(v) => setR("rewrite", v)}
+          disabled={submitted}
+          placeholder="Write the exact words you'd use. Be specific."
+          minHeight={90}
+        />
+      </div>
+
+      <div style={{ marginBottom: 14 }}>
+        <Eyebrow>What were you tempted to say instead, and why?</Eyebrow>
+        <TextArea
+          value={r.tempted}
+          onChange={(v) => setR("tempted", v)}
+          disabled={submitted}
+          placeholder="Honest is better than tidy. The fix-it impulse, the sympathy reflex, the urge to move on..."
+          minHeight={70}
+        />
+      </div>
+
+      <div style={{ display: "flex", justifyContent: "flex-end" }}>
+        <SubmitBtn onClick={onSubmit} disabled={submitted} />
+      </div>
+
+      <SuggestedReveal show={submitted} title="One way to handle this moment">
+        <div style={{ fontSize: 13, color: TEXT, lineHeight: 1.7 }}>
+          {m.sample}
+        </div>
+        <div style={{
+          marginTop: 14, padding: 12, background: GOLD_LIGHT,
+          borderRadius: 8, fontSize: 12, color: TEXT_MID, lineHeight: 1.6,
+        }}>
+          <strong style={{ color: GOLD_DARK }}>The synthesis move:</strong> Notice what's happening in a moment like this. Maya's "I knew I'd be terrible at this" is a statement about her <em>autonomy</em> (she sees herself as someone who needs to be rescued), her <em>competence</em> (she's pre-emptively certain she'll fail), and her <em>relatedness</em> (she's worried about being a burden to you, or to her daughter). All three live in the same sentence. MI is what lets you respond to all three at once, instead of picking one and patching it. A reflection of feeling addresses competence and relatedness. An open question about what mattering to her looks like addresses autonomy. The work isn't a technique applied to a sentence. It's hearing the whole person in the sentence and replying to that.
+        </div>
+      </SuggestedReveal>
+    </ActivityWrap>
+  );
+}
+
+// ============================================================================
+// LANDING SCREEN
+// ============================================================================
+
+function Landing({ onStart, hasProgress, onReset }) {
+  return (
+    <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", background: WARM, fontFamily: "'DM Sans', -apple-system, sans-serif" }}>
+      <style>{`@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=DM+Mono:wght@400;500&display=swap'); @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }`}</style>
+
+      <Topbar showCount={false} completedCount={0} onReset={hasProgress ? onReset : null} />
+
+      <div style={{
+        flex: 1, display: "flex", flexDirection: "column",
+        alignItems: "center", justifyContent: "center",
+        padding: "40px 20px", textAlign: "center",
+      }}>
+        <div style={{
+          width: 64, height: 64, background: TEAL, borderRadius: 18,
+          display: "flex", alignItems: "center", justifyContent: "center",
+          marginBottom: 20, color: WHITE,
+        }}>
+          <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+          </svg>
+        </div>
+        <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: ".1em", textTransform: "uppercase", color: TEAL_DARK, marginBottom: 10 }}>
+          Self-paced training
+        </div>
+        <h1 style={{ fontSize: 28, fontWeight: 700, color: NAVY, margin: "0 0 10px", lineHeight: 1.2 }}>
+          Digital Health Navigator Training
+        </h1>
+        <p style={{ fontSize: 15, color: TEXT_MID, lineHeight: 1.6, maxWidth: 540, margin: "0 0 28px" }}>
+          A four-module training in the technical, pedagogical, and interpersonal competencies of the Digital Health Navigator role: troubleshooting, digital literacy instruction, app matching, and motivational interviewing.
+        </p>
+
+        <div style={{
+          background: WHITE, border: `1px solid ${WARM_DIM}`, borderRadius: 14,
+          padding: 8, width: "100%", maxWidth: 560, marginBottom: 24, textAlign: "left",
+        }}>
+          {modules.map((m, i) => {
+            const fullName = m.id === "troubleshooting" ? "Troubleshooting & Digital Autonomy"
+              : m.id === "competence" ? "DOORS & Digital Competence"
+              : m.id === "relatedness" ? "Healthcare & Digital Relatedness"
+              : "Motivational Interviewing & Digital Navigation";
+            const blurb = m.id === "troubleshooting" ? "Resource guides, the three-step troubleshooting process, AI roleplay practice"
+              : m.id === "competence" ? "DOORS curriculum, teaching techniques, chunking, AI roleplay practice"
+              : m.id === "relatedness" ? "MindApps framework, Health Goals Survey, Use Plan, AI roleplay practice"
+              : "OARS skills (open questions, affirmations, reflection, summaries), AI roleplay practice";
+            return (
+              <div key={m.id} style={{
+                display: "flex", alignItems: "flex-start", gap: 14,
+                padding: "14px", borderRadius: 10,
+                borderTop: i > 0 ? `1px solid ${WARM_DIM}` : "none",
+              }}>
+                <div style={{
+                  width: 30, height: 30, borderRadius: 8,
+                  background: TEAL_LIGHT, color: TEAL_DARK,
+                  fontSize: 13, fontWeight: 700,
+                  display: "flex", alignItems: "center", justifyContent: "center",
+                  flexShrink: 0, marginTop: 2,
+                }}>
+                  {i + 1}
+                </div>
+                <div>
+                  <div style={{ fontSize: 14, fontWeight: 600, color: TEXT, marginBottom: 2 }}>{fullName}</div>
+                  <div style={{ fontSize: 12, color: TEXT_LIGHT, lineHeight: 1.5 }}>{blurb}</div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+
+        <button
+          onClick={onStart}
+          style={{
+            padding: "14px 32px", borderRadius: 12, border: "none",
+            background: TEAL, color: WHITE, fontSize: 15, fontWeight: 600,
+            cursor: "pointer", boxShadow: "0 2px 12px rgba(42,157,143,.3)",
+            fontFamily: "inherit",
+          }}
+        >
+          {hasProgress ? "Resume training" : "Start training"}
+        </button>
+        <p style={{ fontSize: 11, color: TEXT_LIGHT, marginTop: 18, maxWidth: 480 }}>
+          {hasProgress
+            ? "Your progress is saved on this device. Use the menu in the top right to clear it."
+            : "Approximately 6–8 hours total. Each module includes concept material, interactive activities, and an asynchronous practice session with an AI chatbot. Your progress will be saved on this device."}
+        </p>
+      </div>
+
+      <Footer />
+    </div>
+  );
+}
+
+// ============================================================================
+// CHROME
+// ============================================================================
+
+function Topbar({ showCount, completedCount, onReset }) {
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [confirming, setConfirming] = useState(false);
+
+  return (
+    <div style={{
+      background: NAVY, color: WHITE, padding: "14px 24px",
+      display: "flex", alignItems: "center", justifyContent: "space-between",
+      position: "sticky", top: 0, zIndex: 100, boxShadow: "0 2px 8px rgba(0,0,0,.15)",
+    }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+        <div style={{
+          width: 28, height: 28, background: TEAL, borderRadius: 7,
+          display: "flex", alignItems: "center", justifyContent: "center",
+        }}>
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+          </svg>
+        </div>
+        <span style={{ fontSize: 13, fontWeight: 700, letterSpacing: ".08em", textTransform: "uppercase" }}>
+          DHN Training
+        </span>
+      </div>
+      <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+        {showCount && (
+          <div style={{ fontSize: 12, color: "rgba(255,255,255,.5)" }}>
+            {completedCount}/{modules.length} completed
+          </div>
+        )}
+        {onReset && (
+          <div style={{ position: "relative" }}>
+            <button
+              onClick={() => setMenuOpen(!menuOpen)}
+              aria-label="Menu"
+              style={{
+                background: "transparent", border: "none", color: "rgba(255,255,255,.7)",
+                cursor: "pointer", padding: 4, display: "flex", alignItems: "center", fontFamily: "inherit",
+              }}
+            >
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <circle cx="12" cy="5" r="1.5"/><circle cx="12" cy="12" r="1.5"/><circle cx="12" cy="19" r="1.5"/>
+              </svg>
+            </button>
+            {menuOpen && (
+              <div style={{
+                position: "absolute", top: "calc(100% + 8px)", right: 0,
+                background: WHITE, color: TEXT, borderRadius: 10,
+                boxShadow: "0 4px 16px rgba(0,0,0,.18)", padding: 6,
+                minWidth: 220, zIndex: 200,
+              }}>
+                {!confirming ? (
+                  <button
+                    onClick={() => setConfirming(true)}
+                    style={{
+                      width: "100%", textAlign: "left", padding: "10px 12px",
+                      border: "none", background: "transparent",
+                      fontSize: 13, color: TEXT, cursor: "pointer", borderRadius: 6,
+                      fontFamily: "inherit",
+                    }}
+                  >
+                    Reset all progress
+                  </button>
+                ) : (
+                  <div style={{ padding: "10px 12px" }}>
+                    <div style={{ fontSize: 12, color: TEXT_MID, marginBottom: 10, lineHeight: 1.5 }}>
+                      Clear all your saved answers and module progress? This can't be undone.
+                    </div>
+                    <div style={{ display: "flex", gap: 6 }}>
+                      <button
+                        onClick={() => { onReset(); setMenuOpen(false); setConfirming(false); }}
+                        style={{
+                          padding: "7px 12px", borderRadius: 6, border: "none",
+                          background: CAUTION, color: WHITE, fontSize: 12, fontWeight: 600,
+                          cursor: "pointer", fontFamily: "inherit",
+                        }}
+                      >
+                        Reset
+                      </button>
+                      <button
+                        onClick={() => setConfirming(false)}
+                        style={{
+                          padding: "7px 12px", borderRadius: 6,
+                          border: `1.5px solid ${WARM_DIM}`,
+                          background: WHITE, color: TEXT_LIGHT, fontSize: 12, fontWeight: 600,
+                          cursor: "pointer", fontFamily: "inherit",
+                        }}
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function Footer() {
+  return (
+    <div style={{
+      background: NAVY, color: "rgba(255,255,255,.6)",
+      textAlign: "center", padding: "22px 20px",
+      fontSize: 11, lineHeight: 1.7, marginTop: "auto",
+    }}>
+      <strong style={{ color: "rgba(255,255,255,.9)" }}>Digital Health Navigator Training</strong><br />
+      Division of Digital Psychiatry<br />
+      Beth Israel Deaconess Medical Center / Harvard Medical School
+    </div>
+  );
+}
+
+// ============================================================================
+// MODULE BODIES
+// ============================================================================
+
+function ModuleBody({ moduleId }) {
+  if (moduleId === "troubleshooting") {
+    return (
+      <>
+        <TroubleshootingConcepts />
+        <ResourceGuideActivity />
+        <TroubleshootingScenarioActivity />
+        <LLMLauncher
+          moduleId="troubleshooting"
+          blurb="Practice the troubleshooting process with an AI client. The chatbot will roleplay as a patient with a technical issue, then evaluate your performance against the three-step process when you finish. Copy the prompt, open your preferred chatbot, and paste it in."
+        />
+      </>
+    );
+  }
+  if (moduleId === "competence") {
+    return (
+      <>
+        <CompetenceConcepts />
+        <ExplainConceptsActivity />
+        <ModuleMatchActivity />
+        <ChunkingActivity />
+        <LLMLauncher
+          moduleId="competence"
+          blurb="Practice teaching a digital skill to an AI client. The chatbot will roleplay as a learner and ask clarifying questions, then give you feedback on clarity, identifying needs, and emotional support."
+        />
+      </>
+    );
+  }
+  if (moduleId === "relatedness") {
+    return (
+      <>
+        <RelatednessConcepts />
+        <KeyPhraseActivity />
+        <HealthGoalsSurveyActivity />
+        <UsePlanActivity />
+        <LLMLauncher
+          moduleId="relatedness"
+          blurb="Practice the full app-matching conversation with an AI client. The chatbot picks one of four client roles and won't reveal everything upfront, so you'll need to ask. After the conversation, it gives feedback on your questioning, guardrails, matching, and attitude."
+        />
+      </>
+    );
+  }
+  if (moduleId === "mi") {
+    return (
+      <>
+        <MIConcepts />
+        <OpenQuestionsActivity />
+        <AffirmationsActivity />
+        <ReflectiveListeningActivity />
+        <SummariesActivity />
+        <SynthesisActivity />
+        <LLMLauncher
+          moduleId="mi"
+          blurb="Practice OARS in a live conversation. The chatbot offers a scenario and difficulty level (Easy, Moderate, Hard), then gives critical feedback on your application of open questions, affirmations, reflections, and summaries."
+        />
+      </>
+    );
+  }
+  return null;
+}
+
+// ============================================================================
+// MAIN APP
+// ============================================================================
+
+export default function App() {
+  const [screen, setScreen] = usePersistentActivity("__screen", "landing");
+  const [currentModule, setCurrentModule] = usePersistentActivity("__currentModule", 0);
+  const [completed, setCompleted] = usePersistentActivity("__moduleCompleted", new Set());
+  // Tick to force re-read of completed-activities after submits in child components
+  const [activityTick, setActivityTick] = useState(0);
+  const [showResetConfirm, setShowResetConfirm] = useState(false);
+  const [showLectures, setShowLectures] = useState(false);
+
+  // Re-read activity completion on every render of App (cheap, just a localStorage read)
+  // and after every focus event (covers cross-tab edits).
+  useEffect(() => {
+    const onFocus = () => setActivityTick((t) => t + 1);
+    if (typeof window !== "undefined") {
+      window.addEventListener("focus", onFocus);
+      // Poll every few seconds while the tab is active to pick up child-component
+      // markActivityDone() calls without prop drilling.
+      const interval = window.setInterval(() => setActivityTick((t) => t + 1), 1500);
+      return () => {
+        window.removeEventListener("focus", onFocus);
+        window.clearInterval(interval);
+      };
+    }
+  }, []);
+
+  const markComplete = useCallback(() => {
+    setCompleted((prev) => {
+      const next = new Set(prev instanceof Set ? prev : []);
+      next.add(modules[currentModule].id);
+      return next;
+    });
+  }, [currentModule, setCompleted]);
+
+  const goToModule = (i) => {
+    setCurrentModule(i);
+    setShowLectures(false);
+    if (typeof window !== "undefined" && typeof window.scrollTo === "function") {
+      try { window.scrollTo({ top: 0, behavior: "smooth" }); } catch {}
+    }
+  };
+
+  const onReset = () => {
+    clearAllProgress();
+    if (typeof window !== "undefined") window.location.reload();
+  };
+
+  const completedSet = completed instanceof Set ? completed : new Set();
+  const progress = (completedSet.size / modules.length) * 100;
+
+  if (screen === "landing") {
+    return (
+      <Landing
+        onStart={() => {
+          setScreen("training");
+          // Only restart from Module 1 if there's no prior progress
+          if (!(completedSet.size > 0 || hasAnyActivityProgress())) {
+            setCurrentModule(0);
+          }
+        }}
+        hasProgress={completedSet.size > 0 || hasAnyActivityProgress()}
+        onReset={onReset}
+        showResetConfirm={showResetConfirm}
+        setShowResetConfirm={setShowResetConfirm}
+      />
+    );
+  }
+
+  const m = modules[currentModule];
+  const completedActivitiesForCurrent = getCompletedActivities(m.id);
+  // activityTick ensures this value is fresh — read above forces re-render
+  void activityTick;
+
+  return (
+    <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", background: WARM, fontFamily: "'DM Sans', -apple-system, sans-serif" }}>
+      <style>{`@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=DM+Mono:wght@400;500&display=swap'); @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }`}</style>
+
+      <Topbar showCount={true} completedCount={completedSet.size} onReset={onReset} />
+
+      <div style={{ background: WARM_DIM, height: 4, width: "100%", position: "sticky", top: 56, zIndex: 99 }}>
+        <div style={{
+          height: "100%",
+          background: `linear-gradient(90deg, ${TEAL}, ${GOLD})`,
+          width: `${progress}%`,
+          transition: "width .6s cubic-bezier(.25,1,.5,1)",
+          borderRadius: "0 3px 3px 0",
+        }} />
+      </div>
+
+      <div style={{ maxWidth: 900, margin: "0 auto", padding: "24px 20px 80px", flex: 1, width: "100%" }}>
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 28 }}>
+          {modules.map((mod, i) => (
+            <button
+              key={mod.id}
+              onClick={() => goToModule(i)}
+              style={{
+                padding: "7px 14px", borderRadius: 20,
+                border: `2px solid ${!showLectures && i === currentModule ? TEAL : WARM_DIM}`,
+                background: !showLectures && i === currentModule ? TEAL_LIGHT : WHITE,
+                color: !showLectures && i === currentModule ? TEAL_DARK : TEXT_LIGHT,
+                fontSize: 12, fontWeight: 600, cursor: "pointer",
+                transition: "all .15s", position: "relative",
+                fontFamily: "inherit",
+              }}
+            >
+              {mod.short}
+              {completed.has(mod.id) && (
+                <span style={{
+                  position: "absolute", top: -4, right: -4,
+                  width: 14, height: 14, background: TEAL, borderRadius: "50%",
+                  color: WHITE, fontSize: 9, lineHeight: "14px", textAlign: "center",
+                }}>
+                  ✓
+                </span>
+              )}
+            </button>
+          ))}
+          <button
+            onClick={() => {
+              setShowLectures(true);
+              if (typeof window !== "undefined" && typeof window.scrollTo === "function") {
+                try { window.scrollTo({ top: 0, behavior: "smooth" }); } catch {}
+              }
+            }}
+            style={{
+              padding: "7px 14px", borderRadius: 20,
+              border: `2px solid ${showLectures ? GOLD : WARM_DIM}`,
+              background: showLectures ? GOLD_LIGHT : WHITE,
+              color: showLectures ? GOLD_DARK : TEXT_LIGHT,
+              fontSize: 12, fontWeight: 600, cursor: "pointer",
+              transition: "all .15s", display: "flex", alignItems: "center", gap: 5,
+              fontFamily: "inherit",
+            }}
+          >
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
+            Lectures
+          </button>
+        </div>
+
+        {showLectures ? (
+          <SupplementalLectures />
+        ) : (
+          <>
+            <div style={{ marginBottom: 24 }}>
+              <Eyebrow>Module {currentModule + 1} of {modules.length}</Eyebrow>
+              <h1 style={{ fontSize: 22, fontWeight: 700, color: NAVY, margin: 0 }}>{m.label}</h1>
+            </div>
+
+            <AudioPlayer moduleId={m.id} src={moduleAudioSrc[m.id]} />
+
+            <ModuleOrientation moduleObj={m} completedActivities={completedActivitiesForCurrent} />
+
+            <ModuleBody moduleId={m.id} />
+
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <button
+                onClick={() => goToModule(Math.max(0, currentModule - 1))}
+                disabled={currentModule === 0}
+                style={{
+                  padding: "11px 22px", borderRadius: 12,
+                  border: `2px solid ${currentModule === 0 ? WARM_DIM : NAVY}`,
+                  background: WHITE,
+                  color: currentModule === 0 ? TEXT_LIGHT : NAVY,
+                  fontSize: 14, fontWeight: 600,
+                  cursor: currentModule === 0 ? "default" : "pointer",
+                  fontFamily: "inherit",
+                }}
+              >
+                Previous
+              </button>
+              <button
+                onClick={() => {
+                  markComplete();
+                  if (currentModule < modules.length - 1) goToModule(currentModule + 1);
+                }}
+                style={{
+                  padding: "11px 22px", borderRadius: 12, border: "none",
+                  background: TEAL, color: WHITE, fontSize: 14, fontWeight: 600,
+                  cursor: "pointer", boxShadow: "0 2px 8px rgba(42,157,143,.25)",
+                  fontFamily: "inherit",
+                }}
+              >
+                {currentModule === modules.length - 1 ? "Complete training" : "Mark complete & next"}
+              </button>
+            </div>
+          </>
+        )}
+      </div>
+
+      <Footer />
+    </div>
+  );
+}
